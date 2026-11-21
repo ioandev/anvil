@@ -9,6 +9,12 @@ hero:
       link: overview/
       icon: right-arrow
       variant: primary
+    - text: See on GitHub
+      link: https://github.com/ioandev/anvil
+      icon: external
+      variant: secondary
+      attrs:
+        class: gh-button
     - text: Quickstart
       link: quickstart/
       variant: minimal
@@ -46,6 +52,37 @@ operated with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as t
     server is a rebuild, not an archaeology project.
   </Card>
 </CardGrid>
+
+## What anvil is not
+
+<CardGrid>
+  <Card title="Not highly available" icon="warning">
+    One server is the whole platform: a reboot or a dead VM is downtime. The watchdog on a second machine makes sure
+    you hear about it; it doesn't keep the sites up.
+  </Card>
+  <Card title="Not multi-tenant" icon="error">
+    It assumes one owner who trusts every project on the box. Each project's own namespace, user and database login
+    limit mistakes, not a determined attacker inside one app.
+  </Card>
+  <Card title="Not a PaaS" icon="seti:yml">
+    No push-to-deploy: every project is a Kubernetes manifest you (or Claude Code) write. `scripts/new-site` gives you
+    one that already follows the rules.
+  </Card>
+  <Card title="Not hands-off" icon="phone">
+    The phone can ring at night. The autopilot fixes the easy incidents only, OS updates are run by hand, and new
+    sites still need a person for DNS.
+  </Card>
+  <Card title="Not cloud-agnostic" icon="cloud-download">
+    It's built on Scaleway, Cloudflare (Free), Twilio and Tailscale. Moving to another provider means rewriting
+    `infra/`, not changing a setting.
+  </Card>
+  <Card title="Not for big workloads" icon="rocket">
+    One VM and one shared MariaDB suit many small projects. A site that outgrows it can move to its own pool node
+    for a while, but this is no cluster for heavy traffic.
+  </Card>
+</CardGrid>
+
+More in the [overview](/overview/#what-anvil-is-not).
 
 ## Start here
 

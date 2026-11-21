@@ -132,3 +132,17 @@
   :root[data-hide-toc] .main-pane { width: 100%; --sl-content-margin-inline: auto; }
 }
 @media print { .sl-toggle { display: none !important; } }
+
+/* The home page's "See on GitHub" button: black with white text in both themes (a thin border keeps it visible on a
+   dark page). */
+.hero a.gh-button {
+  background: #000;
+  color: #fff;
+  border: 1px solid #000;
+}
+:root[data-theme='dark'] .hero a.gh-button { border-color: #5c5f66; }
+.hero a.gh-button:hover {
+  background: #24292f;
+  color: #fff;
+  border-color: #24292f;
+}
