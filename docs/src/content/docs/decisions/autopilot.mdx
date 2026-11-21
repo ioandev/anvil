@@ -26,11 +26,11 @@ Run Claude Code headless in a container on the second machine, started by alerts
 
 ## Consequences
 
-- + The easy incidents are fixed in minutes, with a written post-mortem the owner reads over breakfast.
-- + It gives up correctly when no allowed action can help (tested), and says what the human should do.
-- − It holds powerful credentials; the guard is a guardrail, not a sandbox ([open item](/security/#open-items)).
-- − It costs a Claude credential and some money per run (capped by limits and a spend limit).
-- − Prompt injection through logs is possible in principle; the prompt treats logs, pages and repo files as data.
+- **Gain:** The easy incidents are fixed in minutes, with a written post-mortem the owner reads over breakfast.
+- **Gain:** It gives up correctly when no allowed action can help (tested), and says what the human should do.
+- **Cost:** It holds powerful credentials; the guard is a guardrail, not a sandbox ([open item](/security/#open-items)).
+- **Cost:** It costs a Claude credential and some money per run (capped by limits and a spend limit).
+- **Cost:** Prompt injection through logs is possible in principle; the prompt treats logs, pages and repo files as data.
 
 ## Alternatives considered
 
@@ -41,10 +41,10 @@ Run Claude Code headless in a container on the second machine, started by alerts
 
 ## How it was decided
 
-The owner's requirements, in his words or close to them: a **prebuilt**, multi-arch, open-sourceable image; skills
+The owner's requirements, in their words or close to them: a **prebuilt**, multi-arch, open-sourceable image; skills
 inside the image; "no need for phases, I need it all built"; polls every 15 s; give up after 15 minutes and don't
 retrigger, but re-arm on its own (a 60-minute cooldown, 2 healthy minutes, or a reset link), at most 4 runs a day;
-don't trigger while he is deploying; full transcripts, viewable from any machine; post-mortems. Claude's design
+don't trigger while they are deploying; full transcripts, viewable from any machine; post-mortems. Claude's design
 choices on top: the Mac polls and the server never calls it; **live-only actions** (the repo may hold unreleased
 work); a strict "fixed"; a **read-only** deploy key (GitHub couldn't protect `main` on a private personal repo);
 tools restricted to `Bash`, `Read`, `Skill`, `WebSearch` after reading a transcript; a pre-run stale check after a

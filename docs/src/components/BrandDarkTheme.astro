@@ -1,0 +1,8 @@
+---
+// A dark-only brand (src/brand/brand.json "theme": "dark"): always Starlight's dark theme, whatever the visitor's
+// system or a stored choice says. Every colour (callouts, code blocks, badges) then comes from the dark palette.
+---
+<script is:inline>
+	document.documentElement.dataset.theme = 'dark';
+	window.StarlightThemeProvider = { updatePickers() {} };
+</script>

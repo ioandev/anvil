@@ -21,13 +21,13 @@ should never expire on a Sunday, and a compromised server should not hand an att
 
 ## Consequences
 
-- + Only your zones can complete a TLS handshake with the origin, even from inside Cloudflare's network.
-- + No certificate renewals to break; no DNS-01 token in a Kubernetes Secret.
-- + DDoS protection, caching and edge TLS for free.
-- − Everything depends on Cloudflare; a direct-to-origin test needs the client cert (`scripts/node.sh curl`).
-- − Free plan limits apply (e.g. request body size caps on uploads); a service that needs large uploads must live
+- **Gain:** Only your zones can complete a TLS handshake with the origin, even from inside Cloudflare's network.
+- **Gain:** No certificate renewals to break; no DNS-01 token in a Kubernetes Secret.
+- **Gain:** DDoS protection, caching and edge TLS for free.
+- **Cost:** Everything depends on Cloudflare; a direct-to-origin test needs the client cert (`scripts/node.sh curl`).
+- **Cost:** Free plan limits apply (e.g. request body size caps on uploads); a service that needs large uploads must live
   outside the proxy with its own certificate.
-- − Moving a domain has traps: per-zone nameservers, edge certificate lag after activation, stale DNS at Google for
+- **Cost:** Moving a domain has traps: per-zone nameservers, edge certificate lag after activation, stale DNS at Google for
   up to two days ([Edge](/components/edge/#moving-a-domain-onto-the-platform)).
 
 ## Alternatives considered
@@ -45,7 +45,7 @@ should never expire on a Sunday, and a compromised server should not hand an att
   Tailscale-only; the owner overruled it ("I might lose Tailscale"), so SSH moved to an odd port instead, listening
   on both ports until the new one was confirmed.
 - The owner suggested Authenticated Origin Pulls; Claude chose **an own CA** over Cloudflare's shared certificate.
-- Let's Encrypt came with the copied base repo. The owner asked "why are we running Let's Encrypt?" when he found a
+- Let's Encrypt came with the copied base repo. The owner asked "why are we running Let's Encrypt?" on finding a
   Cloudflare token on the server; within minutes it was Origin CA certificates and no token on the server, and the old
   account-wide token was revoked (which also killed keys that depended on it: rotate deliberately).
 - Client IPs: ServiceLB rewrites the source address, so Traefik trusts the pod CIDR for forwarded headers. That's

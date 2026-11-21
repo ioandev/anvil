@@ -19,13 +19,13 @@ project (`node.sh restore-db <ns>`). Every password was regenerated at the merge
 
 ## Consequences
 
-- + One process and one buffer pool: RAM goes to apps instead.
-- + One backup job dumps every database (as a read-only user); one health check (`/database`).
-- + Least privilege by default: an app's credentials can't read another project's data.
-- − **A shared failure domain**: if atlas is down, every database-backed app is down. The autopilot is not allowed
+- **Gain:** One process and one buffer pool: RAM goes to apps instead.
+- **Gain:** One backup job dumps every database (as a read-only user); one health check (`/database`).
+- **Gain:** Least privilege by default: an app's credentials can't read another project's data.
+- **Cost:** **A shared failure domain**: if atlas is down, every database-backed app is down. The autopilot is not allowed
   to restart or delete it (it reports instead); it's watched by `/database` and `StatefulSetUnavailable`.
-- − Server-wide settings (full-text token size, stopwords) apply to everyone.
-- − Version choice is shared (the original server runs the latest MariaDB, chosen over LTS).
+- **Cost:** Server-wide settings (full-text token size, stopwords) apply to everyone.
+- **Cost:** Version choice is shared (the original server runs the latest MariaDB, chosen over LTS).
 
 ## Alternatives considered
 
@@ -37,7 +37,7 @@ project (`node.sh restore-db <ns>`). Every password was regenerated at the merge
 ## How it was decided
 
 - On night one the owner's rule was the opposite: "the databases have to sit separate like they are now". The next
-  night, with 0.9 GB of RAM left and eleven instances holding 38 MB of data in ~2 GB of RAM, he asked to "merge
+  night, with 0.9 GB of RAM left and eleven instances holding 38 MB of data in ~2 GB of RAM, the owner asked to "merge
   everything … two users for each project … only the database they are using". The decision was reversed with the
   numbers in hand.
 - Claude wanted the LTS line; the owner chose the latest MariaDB.

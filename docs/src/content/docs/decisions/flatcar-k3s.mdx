@@ -21,15 +21,15 @@ and restart them forever; the whole node should come from code.
 
 ## Consequences
 
-- + The node is reproducible: Terraform + Butane, nothing done by hand over SSH.
-- + Kubernetes gives restart-forever, rolling deploys, probes, RBAC and Secrets for free; kube-state-metrics makes
+- **Gain:** The node is reproducible: Terraform + Butane, nothing done by hand over SSH.
+- **Gain:** Kubernetes gives restart-forever, rolling deploys, probes, RBAC and Secrets for free; kube-state-metrics makes
   "is anything stuck" one set of rules.
-- + Single node means no network fabric to debug; everything on local disk.
-- − **Ignition runs once**: config changes after first boot must also be applied by hand on the live box.
-- − Single node = no failover. A reboot is downtime; the off-box watchdog makes sure you hear about it.
-- − Traps paid for: k3s' installer hard-fails on Flatcar's permissive SELinux without two flags; Flatcar's swap
+- **Gain:** Single node means no network fabric to debug; everything on local disk.
+- **Cost:** **Ignition runs once**: config changes after first boot must also be applied by hand on the live box.
+- **Cost:** Single node = no failover. A reboot is downtime; the off-box watchdog makes sure you hear about it.
+- **Cost:** Traps paid for: k3s' installer hard-fails on Flatcar's permissive SELinux without two flags; Flatcar's swap
   units need the documented pattern (or boot-time ordering cycles); kubelet refuses swap unless told.
-- − With OS updates masked, security updates mean a planned rebuild: keep the rebuild path exercised.
+- **Cost:** With OS updates masked, security updates mean a planned rebuild: keep the rebuild path exercised.
 
 ## Alternatives considered
 

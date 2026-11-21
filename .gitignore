@@ -27,3 +27,6 @@ infra/*.tfplan
 node_modules/
 dist/
 __pycache__/
+
+# A brand overlay for the docs (docs/README.md: Brand), copied in at build time
+docs/src/brand/

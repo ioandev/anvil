@@ -24,12 +24,12 @@ credentials without holding the master key on disk.
 
 ## Consequences
 
-- + `git clone` + the age key = everything needed to rebuild; secrets have history and review like code.
-- + No secrets service to run for the apps.
-- − The age key is a single root of trust: losing both copies loses every secret; leaking it exposes all of them.
+- **Gain:** `git clone` + the age key = everything needed to rebuild; secrets have history and review like code.
+- **Gain:** No secrets service to run for the apps.
+- **Cost:** The age key is a single root of trust: losing both copies loses every secret; leaking it exposes all of them.
   Rotate secrets after any suspected leak, not just the key.
-- − Plaintext copies exist on the operator's machine (gitignored); protect that machine.
-- − Two stores (git and the vault) to keep in sync for the few operator credentials.
+- **Cost:** Plaintext copies exist on the operator's machine (gitignored); protect that machine.
+- **Cost:** Two stores (git and the vault) to keep in sync for the few operator credentials.
 
 ## Alternatives considered
 
@@ -48,5 +48,5 @@ credentials without holding the master key on disk.
 - Claude's permissions didn't allow printing the age private key; the owner displayed it himself to store it.
 - Later, for unattended automation, Claude compared self-hosted vaults: OpenBao (free, policies, machine logins,
   audit log) won over Passbolt CE (tag-based sharing is paid), Infisical (custom roles paid when self-hosted) and
-  Vaultwarden (ruled out by the owner). The owner first put everything in it; for anvil he decided it holds **only
+  Vaultwarden (ruled out by the owner). The owner first put everything in it; for anvil the owner decided it holds **only
   operator credentials, never the apps' secrets**.

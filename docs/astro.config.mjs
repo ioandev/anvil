@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config'
 import starlight from '@astrojs/starlight'
 import { unified } from '@astrojs/markdown-remark'
+import fs from 'node:fs'
 
 // anvil docs: Astro + Starlight, a static build served by nginx (see Dockerfile).
 // Both are set at BUILD time (the base path is baked into every link):
@@ -8,6 +9,11 @@ import { unified } from '@astrojs/markdown-remark'
 //   ANVIL_DOCS_SITE  origin it is served from (default https://ioan.dev), used for canonical URLs and the sitemap
 const site = process.env.ANVIL_DOCS_SITE || 'https://ioan.dev'
 const rawBase = process.env.ASTRO_BASE || '/anvil'
+// Optional brand overlay (README: Brand): src/brand/ (gitignored, copied in by whoever builds a branded copy) with
+// brand.json { title, logo (or logoLight + logoDark), replacesTitle, favicon, theme: "dark" (dark only), links: [{ label, href }] } and brand.css (loaded after ours).
+const BRAND = './src/brand'
+const brand = fs.existsSync(`${BRAND}/brand.json`) ? JSON.parse(fs.readFileSync(`${BRAND}/brand.json`, 'utf8')) : null
+if (brand) console.log(`docs: brand overlay "${brand.title || 'anvil'}"`)
 const base = ('/' + rawBase.replace(/^\/+|\/+$/g, '')).replace(/^\/$/, '') // "/anvil" or "" (root)
 
 // Markdown links in the content are written root-relative ("/components/edge/"). Starlight prefixes the base for
@@ -34,13 +40,22 @@ export default defineConfig({
   markdown: { processor: unified({ remarkPlugins: [remarkBaseLinks] }) },
   integrations: [
     starlight({
-      title: 'anvil',
+      title: brand?.title || 'anvil',
       description:
         'A reproducible one-server platform: Flatcar + k3s on Scaleway behind Cloudflare, one shared MariaDB, ' +
         'secrets in git, off-site backups, phone alerts and a Claude Code autopilot.',
-      favicon: '/favicon.svg',
-      logo: { src: './src/assets/logo.svg' },
-      customCss: ['./src/styles/custom.css'],
+      favicon: brand?.favicon || '/favicon.svg',
+      logo: brand?.logoLight && brand?.logoDark
+        ? { light: `${BRAND}/${brand.logoLight}`, dark: `${BRAND}/${brand.logoDark}`, replacesTitle: !!brand?.replacesTitle }
+        : { src: brand?.logo ? `${BRAND}/${brand.logo}` : './src/assets/logo.svg', replacesTitle: !!brand?.replacesTitle },
+      customCss: ['./src/styles/custom.css', ...(fs.existsSync(`${BRAND}/brand.css`) ? [`${BRAND}/brand.css`] : [])],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/ioandev/anvil' }],
+      components: {
+        ...(brand?.links?.length ? { SocialIcons: './src/components/BrandLinks.astro' } : {}),
+        ...(brand?.theme === 'dark'
+          ? { ThemeProvider: './src/components/BrandDarkTheme.astro', ThemeSelect: './src/components/Empty.astro' }
+          : {}),
+      },
       lastUpdated: false,
       pagination: true,
       sidebar: [

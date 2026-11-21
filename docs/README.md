@@ -14,6 +14,19 @@ client-side JavaScript.
 
 Both are baked into the build (every link contains the base), so build once per base path.
 
+## Brand (optional)
+
+To make the docs look like the site that hosts them, put a folder at `src/brand/` before building (gitignored; the
+build log says `docs: brand overlay "<title>"`):
+
+| File | Meaning |
+|---|---|
+| `brand.json` | `{ "title": "anvil", "logo": "logo.svg", "replacesTitle": false, "favicon": "/favicon.png", "theme": "dark", "links": [{ "label": "← example.com", "href": "https://example.com/" }] }` (every key optional; `logoLight` + `logoDark` instead of `logo` for one per theme; `theme: "dark"` makes the site dark only, with no theme picker; `favicon` is a path under `public/`, so copy that file there too) |
+| `brand.css` | loaded after the docs' own CSS: Starlight's colour tokens (`--sl-color-*`), fonts (self-hosted: the CSP allows `font-src 'self'`) |
+| anything else | files `brand.css` or `brand.json` refer to (logo, fonts) |
+
+Without the folder the docs build with anvil's own look.
+
 ## Develop
 
 ```sh

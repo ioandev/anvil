@@ -31,10 +31,10 @@ the labels from day one; the original server added them to all 227 objects in on
 
 ## Consequences
 
-- + No renamed hostnames, no broken baked-in URLs, no selector migrations.
-- + Grafana and alert rules can group by project/component; label-based NetworkPolicies become possible.
-- − Adding labels to pod templates restarts every workload once (a rolling restart; short gaps for singletons).
-- − Two sources of identity (name and labels) to keep consistent; `scripts/templates/app.yaml.tpl` carries them.
+- **Gain:** No renamed hostnames, no broken baked-in URLs, no selector migrations.
+- **Gain:** Grafana and alert rules can group by project/component; label-based NetworkPolicies become possible.
+- **Cost:** Adding labels to pod templates restarts every workload once (a rolling restart; short gaps for singletons).
+- **Cost:** Two sources of identity (name and labels) to keep consistent; `scripts/templates/app.yaml.tpl` carries them.
 
 ## Alternatives considered
 

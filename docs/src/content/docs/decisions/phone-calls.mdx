@@ -22,14 +22,14 @@ when the server itself is gone. Email is kept for things that can wait (backup r
 
 ## Consequences
 
-- + Incidents get noticed within minutes, at night too (outside quiet hours).
-- + The 5-minute grace absorbs blips and gives the autopilot a chance first; the hold while it works is capped
+- **Gain:** Incidents get noticed within minutes, at night too (outside quiet hours).
+- **Gain:** The 5-minute grace absorbs blips and gives the autopilot a chance first; the hold while it works is capped
   (20 minutes, once per incident), so it can't hide an incident.
-- − **False alarms are expensive** (sleep), which forced better rules: ignore work in progress 10 minutes, `for: 5m`,
+- **Cost:** **False alarms are expensive** (sleep), which forced better rules: ignore work in progress 10 minutes, `for: 5m`,
   only count pods that still exist, `zz-` naming for tests.
-- − Self-inflicted pages happened: a new exporter's wrong liveness port paged twice; expiring a silence early
+- **Cost:** Self-inflicted pages happened: a new exporter's wrong liveness port paged twice; expiring a silence early
   resent a stale alert. Both are now rules and runbooks.
-- − Twilio costs a little per number and per call.
+- **Cost:** Twilio costs a little per number and per call.
 
 ## Alternatives considered
 
