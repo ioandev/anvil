@@ -108,10 +108,13 @@ storage:
 %{ endif ~}
           # Image GC: once the disk is 75% full, delete unused images down to
           # 65% (kubelet defaults are 85/80).
+          # seccomp-default: every container gets the runtime's default system-call filter (RuntimeDefault) unless its
+          # spec says otherwise; Kubernetes' own default is none at all (CLAUDE.md rule 19).
           kubelet-arg:
             - "fail-swap-on=false"
             - "image-gc-high-threshold=75"
             - "image-gc-low-threshold=65"
+            - "seccomp-default=true"
 %{ if role == "server" ~}
 
     # k3s auto-applies everything in server/manifests/ (servers only).

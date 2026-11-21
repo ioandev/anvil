@@ -27,6 +27,21 @@ even if the one in front of it fails.
 | Client IP | apps trust exactly 2 proxy hops or `CF-Connecting-IP`; never the left-most `X-Forwarded-For` | [rule 7](/reference/app-rules/#7-client-ip) |
 | Automation | the autopilot's guard hook, read-only deploy key, run limits, scrubbed records | [Autopilot](/components/autopilot/) |
 
+## Containers can't break out
+
+A container is a process on the server's kernel, not a separate machine: one misconfiguration and an attacker who
+takes over an app owns the server. anvil closes the usual ways out (CLAUDE.md rule 20, checked by `sites.py check`):
+
+| Way out | anvil |
+|---|---|
+| A privileged container, extra capabilities | never; apps drop every capability |
+| Host folders, host network/processes | none (Dozzle binds the server's loopback only, read-only) |
+| Gaining privileges inside (setuid programs) | `allowPrivilegeEscalation: false` on every container |
+| Kernel bugs reached through unusual system calls | every pod gets the runtime's seccomp filter (`seccomp-default=true` on each kubelet) |
+| A service account token in the pod | apps' tokens can do nothing; the few with rights are narrow and read-only |
+| The Docker socket | not on the server at all; on the home machine only an allow-list proxy holds it |
+| An old kernel | Flatcar, updated by hand; `/os` turns red when a newer release is out |
+
 ## SSH stays open to the world, on purpose
 
 SSH (key-only, high port) is reachable from anywhere so access survives losing Tailscale. Restricting it to the

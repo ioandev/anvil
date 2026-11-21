@@ -16,7 +16,10 @@
   "dependencies": {
     "@astrojs/markdown-remark": "^7.3.4",
     "@astrojs/starlight": "^0.42.7",
+    "@fontsource/inter": "^5.2.8",
+    "@resvg/resvg-js": "^2.6.2",
     "astro": "^7.4.2",
+    "satori": "^0.18.3",
     "sharp": "^0.35.5"
   }
 }

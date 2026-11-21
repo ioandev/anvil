@@ -150,6 +150,14 @@ def cmd_up(c, rows):
             kc("-n", c["lt"], "scale", f"deploy/{d}", "--replicas=0", check=False)
             die(f"{d} didn't start in 4 minutes; scaled to 0 so it can't page anyone. Its log:\n{log[-1500:]}")
     if c["seed"] and not kc("get", "namespace", c["lt"], "-o", "jsonpath={.metadata.annotations.loadtest/rows}", check=False).stdout:
+        # The app creates its tables when it first reaches its database, which can be after it reports ready (a
+        # port check): wait until the database has tables before filling them (up to 3 minutes).
+        for _ in range(36):
+            if mariadb(c, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE();").strip() not in ("", "0"):
+                break
+            time.sleep(5)
+        else:
+            die("the copy's app never created its tables (3 minutes): look at its log")
         cmd_seed(c, rows)
     ip = env().get("ANVIL_SERVER_IP") or die("ANVIL_SERVER_IP missing in anvil.env")
     r = subprocess.run(["python3", "-I", "scripts/cutover.py", ip, c["host"]], capture_output=True, text=True)

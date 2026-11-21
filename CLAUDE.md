@@ -74,8 +74,14 @@ in whole hours, keep one session for the day, delete test machines as soon as th
     cookie. Never cache a page that is personal without a cookie. Build files and resized images (`/_next/static/`,
     `/_next/image`, `/_astro/`) are cached a day for everyone. Deploys purge the zone; probes send a cookie, so they
     always measure the site itself. `scripts/edge-cache-monitor` samples HIT/MISS over hours.
+20. **No way out of a container**: never `privileged`, never extra capabilities, no host paths (read-only only when
+    unavoidable), no host network/PID/IPC (Dozzle's loopback-only host network is the exception), and
+    **`allowPrivilegeEscalation: false` on every container** (every template has it). Every node's kubelet runs with
+    `seccomp-default=true` (Butane), so each pod gets the runtime's system-call filter: check `Seccomp: 2` in a pod's
+    `/proc/1/status`. On the home machine nothing gets the Docker socket: the autopilot uses the allow-list proxy.
+    After restarting k3s on a server, redeploy Dozzle (its API watch doesn't recover by itself).
 
-`python3 -I scripts/sites.py check` enforces rules 2, 3, 5, 11, 13, 17 (partly), 19 and the hosts; the pre-commit hook
+`python3 -I scripts/sites.py check` enforces rules 2, 3, 5, 11, 13, 17 (partly), 19, 20 and the hosts; the pre-commit hook
 runs it.
 
 ## Sites and UIDs/GIDs

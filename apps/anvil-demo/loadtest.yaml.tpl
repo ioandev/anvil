@@ -24,6 +24,7 @@ ${LT_PLACEMENT}
       containers:
         - name: mariadb
           image: ${LT_MARIADB_IMAGE}
+          securityContext: { allowPrivilegeEscalation: false }
           args: [--character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci, --innodb-buffer-pool-size=512M,
                  --max-connections=500, --performance-schema=OFF, --skip-log-bin,
                  # CAPACITY.md: look at the slow queries under load (kubectl exec ... -- tail /var/lib/mysql/slow.log)

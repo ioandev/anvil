@@ -60,6 +60,7 @@ spec:
       containers:
         - name: webhookd
           image: "${ANVIL_REGISTRY}/webhookd:${ANVIL_WEBHOOKD_TAG}"   # images/webhookd: upstream + redacted request log
+          securityContext: { allowPrivilegeEscalation: false }
           env:
             - { name: WHD_HOOK_SCRIPTS, value: /scripts }
             # webhookd 1.22 passes only these request headers to the hooks (as lowercase env vars); the hooks check

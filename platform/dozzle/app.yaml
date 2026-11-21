@@ -85,6 +85,7 @@ spec:
       containers:
         - name: dozzle
           image: amir20/dozzle:v11.3.2
+          securityContext: { allowPrivilegeEscalation: false }
           env:
             - { name: DOZZLE_MODE, value: k8s }
             - { name: DOZZLE_AUTH_PROVIDER, value: none }

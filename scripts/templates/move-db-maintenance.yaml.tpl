@@ -34,6 +34,7 @@ spec:
       containers:
         - name: nginx
           image: nginxinc/nginx-unprivileged:1.30-alpine
+          securityContext: { allowPrivilegeEscalation: false }
           ports: [${PORTS}]
           resources: { requests: { cpu: 10m, memory: 8Mi }, limits: { memory: 32Mi } }
           readinessProbe: { tcpSocket: { port: ${FIRST_PORT} }, periodSeconds: 2 }

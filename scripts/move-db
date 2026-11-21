@@ -400,12 +400,18 @@ def maint_ready(c):
         return
     if not c["maint_uid"]:
         die("maintenance.uid missing in sites.yaml")
-    ports = json.loads(kc("-n", c["ns"], "get", "service", svc, "-o", "jsonpath={.spec.ports}").stdout)
+    # The pods' real port numbers and names, as the Service resolves them (its targetPort is often a NAME, e.g.
+    # "http"): the responder declares the same names and numbers so the Service reaches it unchanged.
+    sl = json.loads(kc("-n", c["ns"], "get", "endpointslices", "-l", f"kubernetes.io/service-name={svc}",
+                       "-o", "jsonpath={.items[0].ports}").stdout or "[]")
+    if not sl:
+        die(f"no ready endpoints for Service {svc}: can't tell its pods' ports")
+    ports = [{"name": p.get("name") or f"p{p['port']}", "port": int(p["port"])} for p in sl]
     kc("apply", "-f", "-", input=render(MAINT_TPL, {
         "NS": c["ns"], "NAME": f"{svc}-maintenance", "PART_OF": c["ns"], "UID": c["maint_uid"],
-        "LISTEN": "\n".join(f"        listen {p['targetPort']};" for p in ports),
-        "PORTS": ", ".join(f"{{ containerPort: {p['targetPort']} }}" for p in ports),
-        "FIRST_PORT": str(ports[0]["targetPort"])}))
+        "LISTEN": "\n".join(f"        listen {p['port']};" for p in ports),
+        "PORTS": ", ".join(f"{{ name: {p['name']}, containerPort: {p['port']} }}" for p in ports),
+        "FIRST_PORT": str(ports[0]["port"])}))
     kc("-n", c["ns"], "rollout", "status", f"deploy/{svc}-maintenance", "--timeout=120s")
 
 
@@ -519,8 +525,11 @@ def switch(c, src, dst, src_conn, dst_conn, label):
     try:
         # One round trip: lock the app's login, end every connection it has, read the exact last position.
         rows = sql(src, f"ALTER USER {q(c['rw'])}@'%' ACCOUNT LOCK; KILL CONNECTION USER {q(c['rw'])}; "
-                        f"SELECT @@gtid_binlog_pos; SELECT COUNT(*) FROM information_schema.processlist WHERE user = {q(c['rw'])};")
-        pos, left = (rows[0][0] if rows and rows[0] else ""), (rows[1][0] if len(rows) > 1 else "0")
+                        f"SELECT CONCAT('pos:', @@gtid_binlog_pos); SELECT COUNT(*) FROM information_schema.processlist WHERE user = {q(c['rw'])};")
+        # Labelled: an EMPTY position (no write since this server was promoted) would otherwise be dropped as a blank
+        # line and the COUNT read as the position ("0", which MariaDB can't parse as a GTID list).
+        pos = next((r[0][4:] for r in rows if r and r[0].startswith("pos:")), "")
+        left = next((r[0] for r in rows if r and not r[0].startswith("pos:")), "0")
         if left != "0":
             lock_and_drain(src, c["rw"])
             pos = one(src, "SELECT @@gtid_binlog_pos;")

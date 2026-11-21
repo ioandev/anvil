@@ -13,6 +13,7 @@ const rawBase = process.env.ASTRO_BASE || '/anvil'
 // brand.json { title, logo (or logoLight + logoDark), replacesTitle, favicon, theme: "dark" (dark only), links: [{ label, href }] } and brand.css (loaded after ours).
 const BRAND = './src/brand'
 const brand = fs.existsSync(`${BRAND}/brand.json`) ? JSON.parse(fs.readFileSync(`${BRAND}/brand.json`, 'utf8')) : null
+process.env.ANVIL_DOCS_TITLE = brand?.title || 'anvil'
 if (brand) console.log(`docs: brand overlay "${brand.title || 'anvil'}"`)
 const base = ('/' + rawBase.replace(/^\/+|\/+$/g, '')).replace(/^\/$/, '') // "/anvil" or "" (root)
 
@@ -51,11 +52,13 @@ export default defineConfig({
       customCss: ['./src/styles/custom.css', ...(fs.existsSync(`${BRAND}/brand.css`) ? [`${BRAND}/brand.css`] : [])],
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/ioandev/anvil' }],
       components: {
+        Head: './src/components/Head.astro',   // + each page's Open Graph image (src/og.mjs)
         ...(brand?.links?.length ? { SocialIcons: './src/components/BrandLinks.astro' } : {}),
         ...(brand?.theme === 'dark'
           ? { ThemeProvider: './src/components/BrandDarkTheme.astro', ThemeSelect: './src/components/Empty.astro' }
           : {}),
       },
+      head: [{ tag: 'script', content: fs.readFileSync('./src/sidebar-toggles.js', 'utf8') }],   // collapsible sidebars
       lastUpdated: false,
       pagination: true,
       sidebar: [

@@ -290,6 +290,12 @@ def check():
         for k, w, spec in pod_specs(ns):
             if spec.get("enableServiceLinks") is not False:
                 errors.append(f"{ns}: {w} lacks enableServiceLinks: false (rule 5)")
+            for c in spec.get("containers", []) + spec.get("initContainers", []):
+                sc = c.get("securityContext") or {}
+                if sc.get("privileged"):
+                    errors.append(f"{ns}: {w}/{c['name']} is privileged (rule 20)")
+                if sc.get("allowPrivilegeEscalation") is not False:
+                    errors.append(f"{ns}: {w}/{c['name']} lacks allowPrivilegeEscalation: false (rule 20)")
             for c in spec.get("containers", []):
                 if c.get("readinessProbe") and not c.get("livenessProbe"):
                     warnings.append(f"{ns}: {w}/{c['name']} has a readinessProbe but no livenessProbe (rule 11)")
