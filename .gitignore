@@ -1,0 +1,29 @@
+# Secrets: plaintext working copies (their encrypted .sops twins ARE committed)
+anvil.env
+apps/*/prod.env
+platform/*/prod.env
+mac/openbao/seal.key
+mac/openbao/secrets.env
+mac/autopilot/secrets.env
+infra/terraform.tfstate
+infra/terraform.tfstate.*
+# ...but its encrypted twin IS committed
+!infra/terraform.tfstate.sops
+# Generated from the above (scripts/make-secrets.py): never committed
+apps/*/secret.yaml
+platform/*/secret.yaml
+apps/*/atlas-db.yaml
+platform/*/atlas-db.yaml
+platform/*/server-backup.yaml
+# Local data: keys and certs (twins under secrets/.data/, committed), dumps, the Flatcar image
+/.data/
+infra/downloads/
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/local.auto.tfvars
+infra/tfplan
+infra/*.tfplan
+# Build output
+node_modules/
+dist/
+__pycache__/

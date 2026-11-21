@@ -1,0 +1,86 @@
+---
+title: Variables
+description: anvil.env - the values you type and the ones the bootstrap generates (and which step writes each) - plus the Terraform variables they feed.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+Every setting and secret of one platform lives in **`anvil.env`** (gitignored; encrypted twin `anvil.env.sops` in
+git). Start from `anvil.env.example`: `scripts/anvil-secrets init` copies it, generates part 2 and encrypts.
+`scripts/anvil-secrets set K=V` changes one value; `scripts/anvil-secrets missing` lists what you still have to type.
+The Makefile loads `anvil.env` and passes the relevant values to Terraform; manifests and templates use
+`${ANVIL_*}` placeholders, filled in at deploy time (an unknown `${ANVIL_*}` fails the deploy).
+
+<Aside type="caution">
+Fill in part 1 by editing the file yourself. Never paste keys into a chat with an agent, and never commit `anvil.env`.
+</Aside>
+
+## Part 1: you set these
+
+| Variable | Example | Meaning |
+|---|---|---|
+| `ANVIL_NAME` | `anvil` | server hostname and prefix of every cloud resource |
+| `ANVIL_DOMAIN` | `example.com` | a domain you own; becomes a Cloudflare zone (`demo.`, `status.`, `www.`) |
+| `ANVIL_REGION` / `ANVIL_ZONE` | `fr-par` / `fr-par-1` | Scaleway region and availability zone |
+| `ANVIL_INSTANCE_TYPE` | `DEV1-L` | 4 vCPU / 8 GB / 80 GB local SSD |
+| `ANVIL_TIMEZONE` | `Europe/London` | quiet hours and post-mortem dates |
+| `ANVIL_QUIET_HOURS` | `03-07` | no phone calls in these local hours; they wait |
+| `ANVIL_OWNER_EMAIL` | `you@example.com` | backup failure emails, the Monday "backups OK" |
+| `ANVIL_OWNER_PHONE` | E.164 number | who gets phoned |
+| `SCW_ACCESS_KEY`, `SCW_SECRET_KEY`, `SCW_DEFAULT_PROJECT_ID`, `SCW_DEFAULT_ORGANIZATION_ID` | | Scaleway API key (**no expiry date**) and ids |
+| `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` | | token scopes: Zone Read+Edit, DNS Edit, Zone Settings Edit, SSL and Certificates Edit, Cache Settings Edit, Cache Purge, all zones of the account. Never sent to the server |
+| `CLOUDFLARE_PURGE_TOKEN` | optional | a **second** token, Zone Read + Cache Purge only, on your zone: it goes to the server, for the [edge-purger](/components/edge/#edge-caching) (purges a site when its content changes). Empty: the purger waits; deploys still purge |
+| `NAMECHEAP_API_USER`, `NAMECHEAP_API_KEY` | optional | lets 20-cloudflare switch nameservers (API access enabled, this machine's IP whitelisted); empty = a manual step |
+| `TAILSCALE_AUTH_KEY` | | reusable, not ephemeral |
+| `ANVIL_TAILNET_HOST`, `ANVIL_TAILNET_IP` | | the server's MagicDNS name and tailnet IP once it joined (30-infra records them) |
+| `ANVIL_HOME_SSH` | `you@home-machine` | SSH target of the home machine |
+| `ANVIL_HOME_TAILNET_HOST`, `ANVIL_HOME_TAILNET_IP` | | the home machine on the tailnet (containers there can't resolve MagicDNS, hence the IP) |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_API_KEY`, `TWILIO_API_SECRET`, `TWILIO_PHONE_NUMBER` | | phone calls (an API key, revocable on its own) |
+| `ANTHROPIC_API_KEY` | | the autopilot's Claude credential, with a monthly spend limit (default) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | | alternative: a subscription token from `claude setup-token` (about a year; renew before it expires) |
+
+## Part 2: generated, don't type these
+
+| Variable | Written by |
+|---|---|
+| `STATUS_CODE` (24 letters/digits, goes in URLs), `WEBHOOK_TOKEN`, `ALERT_SERVICE_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `ATLAS_ROOT_PASSWORD`, `ATLAS_BACKUP_PASSWORD`, `HEALTH_DB_PASSWORD`, `ATLAS_MONITOR_PASSWORD` (the `atlas_monitor` login of `alerting-mysqld-exporter`: replication status only) | 10-secrets (`anvil-secrets init`; passwords are hex) |
+| `<NS>_RW_PASSWORD`, `<NS>_RO_PASSWORD` per project with a `db:` (e.g. `ANVIL_DEMO_RW_PASSWORD`) | 10-secrets (`new-site init --db` adds the keys) |
+| `<NS>_REPL_PASSWORD` (the `<ns>_repl` sync login on atlas) and `<NS>_DB_ROOT_PASSWORD` (root of the project's own MariaDB while moved), per project with a `move:` | `anvil-secrets init` ([Scale a site out](/operations/scale-out/)) |
+| `ANVIL_AGENT_K3S_VERSION` | `scripts/pool up`, once, from the running master: pool nodes run the master's exact k3s version, never newer (passed to Terraform as `agent_k3s_version`) |
+| `ANVIL_AGE_RECIPIENT` | 10-secrets: your age public key |
+| `ANVIL_SSH_PORT` | the SSH port (default 2222; pick your own non-standard port) |
+| `ANVIL_CF_ZONE_ID` | 20-cloudflare |
+| `ANVIL_SERVER_IP` | 30-infra (`terraform output public_ip`) |
+| `ANVIL_REGISTRY` | 40-platform (the registry namespace) |
+| `BACKUP_BUCKET`, `BACKUP_S3_ACCESS_KEY`, `BACKUP_S3_SECRET_KEY` | 40-platform (bucket + write-only key) |
+| `ANVIL_BACKUP_TAG`, `ANVIL_TWILIO_TAG`, `ANVIL_DEMO_TAG` | `make images` (`scripts/build-images`) |
+| `ANVIL_AUTOPILOT_TAG`, `ANVIL_OPENBAO_BUCKET` | 70-autopilot |
+| `ANVIL_SCW_PROJECT_ID` | copy of `SCW_DEFAULT_PROJECT_ID` (templates can only use `ANVIL_` names) |
+
+App secrets that are random (an app's admin token) are listed under the app's `generate:` in
+[`sites.yaml`](/reference/sites-yaml/) and land in `apps/<ns>/prod.env`, not in `anvil.env`.
+
+## Terraform variables (`infra/variables.tf`)
+
+The Makefile maps `anvil.env` to `TF_VAR_*`: `name`, `domain`, `region`, `zone`, `instance_type`, `ssh_port`,
+`registry_password` (= the Scaleway secret key), `tailscale_auth_key`, `cloudflare_api_token`, `cloudflare_zone_id`,
+`ssh_public_key_path` (`~/.ssh/id_ed25519_anvil.pub`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `name` | `anvil` | hostname, resource names, bucket prefixes |
+| `instance_type` | `DEV1-L` | the server |
+| `root_volume_size_gb` | `80` | the local SSD (DEV1-L includes 80 GB); Flatcar grows the root fs |
+| `swap_size_mb` | `2048` | swapfile |
+| `k3s_channel` | `stable` | k3s release channel |
+| `ssh_port` / `ssh_allowed_cidrs` | `2222` / `["0.0.0.0/0"]` | SSH port (avoid 6443, 10250, 30000–32767) and its sources (open on purpose, key-only) |
+| `cloudflare_ipv4_ranges` | Cloudflare's 15 IPv4 ranges | the only sources allowed on 80/443 |
+| `origin_pull_ca_path` | `../.data/cloudflare-aop/ca.crt` | the CA Traefik requires client certificates from |
+| `image_path`, `bucket_name`, `image_pipeline` | | the Flatcar import chain; `make cleanup` sets `image_pipeline = false` |
+| `tailscale_version` | a sysext version | Tailscale system extension |
+| `pools` | `{}` (anvil sets `demo` in `infra/pools.auto.tfvars`) | node pools: `count`, `type`, `disk_gb`, `iops`, `swap_mb`, `ssh_public_key_path` (must be a `.pub`), `trusted`, `direct`; switched by `scripts/pool` ([Scale a site out](/operations/scale-out/)) |
+| `loadgen` | `count = 0`, `POP2-2C-8G` | the temporary k6 machine (`scripts/pool loadgen`) |
+| `pool_image_pipeline` | `false` | imports the Flatcar block-storage image for pools (`scripts/pool up` turns it on the first time; the image is kept) |
+| `agent_k3s_version` | `""` | pool nodes' k3s version, from `ANVIL_AGENT_K3S_VERSION` |
+| `agent_count` / `agent_instance_type` | `0` / `DEV1-S` | optional small worker nodes, tainted so only pods that tolerate `anvil/light` run there; off by default |
+| `extra_domains`, `acme_email`, `acme_ca_server` | | fallback paths (proxied records from Terraform; Let's Encrypt when not behind Cloudflare) |

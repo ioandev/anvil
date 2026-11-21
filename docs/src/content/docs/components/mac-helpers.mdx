@@ -1,0 +1,77 @@
+---
+title: Mac helpers
+description: The always-on home machine - watchdog, vault, autopilot and backup pull - how they are shipped with scripts/home-deploy, and how it starts after a reboot.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+Some things must not run on the server they watch. anvil puts them on an always-on **home machine** with Docker, on
+the tailnet and reachable by key-based SSH (`ANVIL_HOME_SSH`). The original platform uses a Mac mini (Apple Silicon,
+Docker Desktop); a Linux box works too. Only the launchd agents and the FileVault caveat are Mac-specific.
+
+## What runs there
+
+| Service | How it runs | Master copy in the repo |
+|---|---|---|
+| **Watchdog** (twilio-alert in watchdog mode) | container, `restart: unless-stopped` | `mac/watchdog/` |
+| **Vault** (OpenBao, separate from any other) for operator credentials | container, `restart: unless-stopped`; unseals itself with a static seal key | `mac/openbao/` |
+| Vault snapshot (06:30) | launchd user agent → local folder (30 days) + off-site bucket (90 days, write-only key) | `mac/openbao/` |
+| **Autopilot** | container (compose + a copy of `autopilot.yaml` as fallback) | `mac/autopilot/` |
+| **Backup pull** (07:00) | launchd user agent `com.anvil.backup-pull`, short-lived `rclone` container, a read + list key | `mac/backup-pull/` |
+| Tailscale | menu-bar app; `tailscale serve --https=8200` for the vault | |
+
+## Shipping: `scripts/home-deploy`
+
+```sh
+scripts/home-deploy <component> [image …]     # component = watchdog | autopilot | openbao | backup-pull
+```
+
+It renders `mac/<component>/` with `${ANVIL_*}` from `anvil.env`, copies the result to `~/<component>/` on the home
+machine (compose files, scripts and configs only; never `.env` files or `.sops` twins), loads the named images there
+with `podman save | ssh … docker load` (the home machine needs no registry login), then `docker compose up -d` if there
+is a compose file. Each component's secrets (`.env`, mode 600) are written separately by its bootstrap step and never
+come from git in plaintext.
+
+## Rules for the home machine
+
+- **No source code there.** Images are built on your laptop (`make images`, `scripts/build-images`; arm64 goes through
+  qemu: slow but works) and shipped as above. On the original platform, source was once copied to the Mac to avoid a
+  registry login; it was removed and became this rule.
+- **Every image it runs is also in the registry** as a multi-arch image (amd64 + arm64 under one tag), so it isn't
+  stored only there.
+- **The server never connects to the home machine.** It pulls (`/watchdog`) and posts (autopilot heartbeat,
+  post-mortems, transcripts).
+
+<Aside type="caution" title="zsh trap">
+In zsh, `$M:path` applies the `:r`/`:h` modifiers to `$M`, so `scp file $M:r…` silently copies to a **local**
+folder. Write `"${M}:path"`.
+</Aside>
+
+## What starts by itself
+
+- Docker Desktop starts at login; every container comes back by its restart policy, and the vault unseals itself.
+- Power settings: restart after a power cut, never sleep, wake on network.
+- launchd user agents run once the user session exists.
+
+## The boot-without-login gap
+
+With **FileVault on**, a restarted Mac waits at the unlock screen until someone types the password: no Docker, no
+Tailscale, nothing. macOS doesn't allow automatic login with FileVault on, and Docker Desktop and the Tailscale app
+are per-user apps. Until someone logs in: the watchdog doesn't watch, the autopilot doesn't run, the vault is
+unreachable, and no backup pull runs. (`MacOffline` on the server calls you after 10 minutes, so you'll know.)
+
+| Option | Comes back alone after | Cost |
+|---|---|---|
+| FileVault off + automatic login | any restart, power cuts included | disk not encrypted at rest: whoever takes the Mac can read the vault's seal key and data |
+| Keep FileVault; planned restarts with `sudo fdesetup authrestart`; macOS updates only by hand | planned restarts | an unplanned restart (power cut, crash) still waits for a person |
+| The above + a UPS | short power cuts too | a UPS |
+
+The recommendation is the second option (plus a UPS) while the vault holds sensitive keys; the first only if the Mac
+is somewhere nobody else can reach. A Linux home machine with a system-level Docker and `tailscaled` avoids the
+per-user-app part of the problem (disk encryption still needs someone to unlock it).
+
+## Planned: a stand-in for the Mac
+
+For when the Mac can't be trusted for a while (a long trip): a script would create a small cloud instance, restore
+the vault from its newest off-site snapshot with the seal key, start the watchdog and the autopilot there, rotate
+the automation's AppRole secret, and move it all back afterwards. Not built.

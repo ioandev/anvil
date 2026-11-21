@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Add a site in one go, from sites.yaml.
+
+  scripts/new-site init <ns> <host> [--db] [--image IMG] [--port N] [--health PATH]
+      Takes the next free UID block, adds <ns> to sites.yaml (host, www, probe, db), writes apps/<ns>/app.yaml from
+      scripts/templates/app.yaml.tpl (every rule built in) and, with --db, the DB passwords in anvil.env
+      (scripts/anvil-secrets init generates them).
+      Local files only. Review them, then:
+  scripts/new-site plan <ns>      print every step `apply` would run (default; changes nothing)
+  scripts/new-site apply <ns>     run them: Cloudflare zone (if new) + origin-pull, Origin CA cert, render, secrets,
+                                  atlas users, deploy origin-ca/www/alerting/<ns>, DNS cutover, then verify.
+
+A new zone also needs its nameservers moved at the registrar, which this can't do for you unless asked: `apply` stops
+after creating the zone and prints the nameserver pair (CLAUDE.md rule 9: wait for the zone's edge certificate before
+the cutover; check dns.google for stale answers).
+"""
+import os, pathlib, re, secrets, subprocess, sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "scripts"))
+import anvil_env  # noqa: E402
+import sites  # noqa: E402
+
+anvil_env.export()
+
+os.chdir(REPO)
+
+
+def die(msg):
+    print("new-site:", msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def arg(flag, default=None):
+    a = sys.argv
+    return a[a.index(flag) + 1] if flag in a else default
+
+
+def zone_of(host):
+    zs = sorted(sites.zones(), key=len, reverse=True)
+    return next((z for z in zs if host == z or host.endswith("." + z)), None)
+
+
+def init(ns, host):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{1,30}", ns):
+        die("namespace must be lowercase letters, digits and dashes")
+    if ns in sites.namespaces():
+        die(f"{ns} is already in sites.yaml")
+    if (REPO / "apps" / ns).exists() or (REPO / "platform" / ns).exists():
+        die(f"apps/{ns} or platform/{ns} already exists")
+    data = sites.load()
+    uid = data["next_uid_block"]
+    zone = zone_of(host) or ".".join(host.split(".")[-2:])
+    new_zone = zone not in sites.zones()
+    apex = host == zone
+    db = ns.replace("-", "_") if "--db" in sys.argv else None
+    health = arg("--health", "/")
+    entry = [f"  {ns}:", "    tier: app", f"    hosts: [{host}]"]
+    if apex:
+        entry.append(f"    www: [{host}]")
+    entry.append(f'    probes: ["https://{host}{health if health != "/" else "/"}"]')
+    if db:
+        entry.append(f"    db: {db}")
+    entry.append(f"    uids: [{uid}-{uid + 9}]")
+    s = sites.SITES.read_text()
+    marker = "\n# Never reuse:"
+    if marker not in s:
+        die("sites.yaml: can't find where the namespaces list ends")
+    s = s.replace(marker, "\n" + "\n".join(entry) + "\n" + marker, 1)
+    s = re.sub(r"^next_uid_block: \d+", f"next_uid_block: {uid + 10}", s, count=1, flags=re.M)
+    if new_zone:
+        s = s.replace("\n# One entry per namespace", f'\n  {zone}: {{records: ["@", www, _dmarc]}}\n# One entry per namespace', 1)
+    sites.SITES.write_text(s)
+    d = REPO / "apps" / ns
+    d.mkdir(parents=True)
+    tpl = (REPO / "scripts/templates/app.yaml.tpl").read_text()
+    (d / "app.yaml").write_text(tpl.format(ns=ns, host=host, uid=uid, uid_block=f"{uid}-{uid + 9}",
+                                           image=arg("--image", "nginxinc/nginx-unprivileged:stable-alpine"),
+                                           port=arg("--port", "8080"), health=health))
+    if db:
+        subprocess.run([sys.executable, "-I", "scripts/anvil-secrets", "init"], check=True)  # its <NS>_RW/RO_PASSWORD
+    subprocess.run([sys.executable, "-I", "scripts/sites.py", "render"], check=True)
+    print(f"added {ns}: {host}, UIDs {uid}-{uid + 9}" + (f", database {db}" if db else "") +
+          (f", NEW zone {zone}" if new_zone else ""))
+    print(f"review sites.yaml and apps/{ns}/app.yaml, then: scripts/new-site plan {ns}")
+
+
+def steps(ns):
+    v = sites.namespaces().get(ns) or die(f"{ns} isn't in sites.yaml (scripts/new-site init first)")
+    hs = sites.hosts(ns)
+    zones = sorted({zone_of(h) for h in hs if zone_of(h)})
+    out = [("check sites.yaml and the manifests", ["python3", "-I", "scripts/sites.py", "check"]),
+           ("render the generated parts (www route, TLSStore, CLAUDE.md)", ["python3", "-I", "scripts/sites.py", "render"]),
+           (f"Cloudflare zone(s) {', '.join(zones)}: create if missing, mirror records, Full (strict), origin pulls",
+            ["python3", "-I", "scripts/cloudflare-zones.py"]),
+           ("Origin CA certificate per zone (zone + *.zone)", ["python3", "-I", "scripts/origin-certs.py"]),
+           ("secrets (incl. atlas-db, the TLS secrets and the Prometheus probes)", ["python3", "-I", "scripts/make-secrets.py"])]
+    if v.get("db"):
+        out.append(("database users (atlas)", ["scripts/node.sh", "atlas-users"]))
+    out += [("deploy origin-ca, www, alerting (probes) and the site",
+             ["scripts/node.sh", "deploy", "origin-ca", "www", "alerting", ns]),
+            ("STOP if a zone is new: move its nameservers, wait for the edge certificate (rule 9)", None),
+            (f"DNS cutover: {' '.join(hs)} → {sites.load()['server_ip']} (proxied)",
+             ["python3", "-I", "scripts/cutover.py", sites.load()["server_ip"], *hs]),
+            ("verify each host through Traefik with the origin-pull cert", [["scripts/node.sh", "curl", h] for h in hs])]
+    return out
+
+
+def show(ns):
+    for i, (what, cmd) in enumerate(steps(ns), 1):
+        print(f"{i:2}. {what}")
+        if cmd and isinstance(cmd[0], list):
+            for c in cmd:
+                print("      $ " + " ".join(c))
+        elif cmd:
+            print("      $ " + " ".join(cmd))
+
+
+def apply(ns):
+    for what, cmd in steps(ns):
+        print(f"==> {what}", flush=True)
+        if cmd is None:
+            ans = input("    Are all zones active with an edge certificate, and not stale on dns.google? [y/N] ")
+            if ans.strip().lower() != "y":
+                die("stopped before the cutover; re-run `apply` when the zone is ready (earlier steps are idempotent)")
+            continue
+        for c in (cmd if isinstance(cmd[0], list) else [cmd]):
+            if subprocess.run(c).returncode != 0:
+                die(f"step failed: {' '.join(c)}")
+    print(f"{ns} is live. Check https://status.{os.environ.get('ANVIL_DOMAIN', '<domain>')}/cluster?code=… is 200 (rule 13).")
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) >= 3 and a[0] == "init":
+        init(a[1], a[2])
+    elif len(a) == 2 and a[0] in ("plan", "apply"):
+        (show if a[0] == "plan" else apply)(a[1])
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

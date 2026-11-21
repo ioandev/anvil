@@ -1,0 +1,146 @@
+---
+title: Data & backups
+description: One shared MariaDB with two least-privilege users per project, grants as code, per-project restores, nightly off-site backups with a write-only key, and encrypted local copies on any machine.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+## One shared MariaDB: `atlas`
+
+| | |
+|---|---|
+| Workload | StatefulSet `atlas-mariadb` in namespace `atlas`, Service `atlas-mariadb.atlas:3306` |
+| Image | `mariadb:13.0.2` (latest, chosen over LTS on the original server) |
+| Storage | one 30 Gi `local-path` volume on the node's SSD |
+| Tuning | buffer pool 128M (plenty for small projects' data and indexes; it was 512M), `max_connections` 300, utf8mb4 |
+| Binary log | only the databases of projects that can [move to their own server](/operations/scale-out/) (`--binlog-do-db`, generated from `move:` in `sites.yaml`), GTIDs in strict mode, kept 2 days |
+| root | only from inside the pod (`MARIADB_ROOT_HOST=localhost`); no app ever uses it |
+
+On the original server it replaced eleven per-project MariaDB containers ([why](/decisions/shared-mariadb/)).
+Server-wide settings (for example full-text token size) apply to every project, so agree on them. Caches like Redis
+stay per project (rebuildable); SQLite apps keep their file on their own volume and can use the [SQLite backup](#sqlite)
+pattern.
+
+### Two users per project, limited to its database
+
+| User | Grants | For |
+|---|---|---|
+| `<ns>_rw` | SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT **on `<db>.*`** | the app, including the DDL its migrations run |
+| `<ns>_ro` | SELECT, SHOW VIEW **on `<db>.*`** | inspection, reporting, health checks |
+| `atlas_backup` | SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES, SHOW CREATE ROUTINE on every database | the nightly dump |
+| `health` | USAGE only: can log in, can't read anything | the `/database` status check |
+| `atlas_monitor` | PROCESS, BINLOG MONITOR, SLAVE MONITOR; at most 3 connections; no data | replication status for the moved-database alerts |
+| `<ns>_repl` (projects with `move:`) | the sync login: replication, plus read access to its own database only | a [live database move](/operations/scale-out/#live-database-moves) |
+
+`SHOW DATABASES` shows each user only its own database. A project that needs even less can get narrower users
+(on the original server, one app's backend can insert tokens but never read them back).
+
+### Grants are code
+
+- Which project has which database: `db:` in [`sites.yaml`](/reference/sites-yaml/).
+- Passwords: random, generated once by `scripts/anvil-secrets`, in `anvil.env` as `<NS>_RW_PASSWORD` /
+  `<NS>_RO_PASSWORD` (plus `ATLAS_ROOT_PASSWORD`, `ATLAS_BACKUP_PASSWORD`, `HEALTH_DB_PASSWORD`), encrypted twin in git.
+- `scripts/node.sh atlas-users` creates or updates every user, password and grant from those two sources. It is
+  idempotent; the SQL is piped in and never written to disk.
+- Apps get a per-namespace Secret `atlas-db` (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` = `<ns>_rw`,
+  `DB_PASSWORD`), written by `make-secrets.py` and applied by `node.sh deploy` before the app. Use `envFrom`,
+  single keys, or `$(DB_PASSWORD)` inside a `DATABASE_URL`.
+
+Connect by hand, read-only:
+
+```sh
+scripts/node.sh kubectl -n atlas exec -it atlas-mariadb-0 -- mariadb -h127.0.0.1 -u <ns>_ro -p <db>
+```
+
+## Nightly off-site backups
+
+| Job | When (UTC) | What |
+|---|---|---|
+| `atlas/atlas-backup` | 03:30 | every database in atlas, one gzipped `mariadb-dump` each, as `atlas_backup` |
+| `atlas/backup-watch` | 08:00 | finds every CronJob labelled `app.kubernetes.io/component=backup`, in any namespace; emails if any hasn't succeeded in 26 h; a "backups OK" email every Monday |
+| an app's own backup (optional) | your choice | `server-backup sqlite <name> <dir>` for SQLite files; label it `component: backup` and the checks find it |
+
+All run the `anvil-backup` image (`platform/backup/`: MariaDB client, sqlite3, curl). Uploads go to a **private
+bucket** under `daily/<date>/<source>/` and, on the 1st of the month, also `monthly/<YYYY-MM>/<source>/`. Bucket
+lifecycle rules delete `daily/` after **30 days** and `monthly/` after **365 days**.
+
+### The key can only write
+
+The server's backup key (a Scaleway IAM application) has `ObjectStorageObjectsWrite` and permission to send email
+through Scaleway TEM, nothing else. It can't list, read, `HEAD` or delete, which is why uploads are plain signed
+PUTs (`curl --aws-sigv4`). **Nothing on the server can remove or read old backups**, so ransomware or a bad command
+on the server can't take the history with it. Reading them takes an admin key, which stays on your laptop.
+
+### Failure is loud, silence is too
+
+- A failed night **emails** you (Scaleway TEM's HTTP API) and posts a line to the [error latch](/components/status-webhooks/#error_arduino).
+- `backup-watch` catches jobs that **never started** (they can't report themselves). Its RBAC is `get`/`list` on
+  CronJobs, nothing else; it finds them by the label (rule 17), so a new app's backup job is checked automatically.
+  It fails closed: a CronJob it can't read counts as failed.
+- The Monday "backups OK" email exists so that the watchdog itself is watched: if it stops arriving, the
+  watchdog is broken.
+- `/backups` on the status webhook (reported by health-watch every 15 min, same label) turns red when any backup is
+  older than 26 h, and is part of `/overall`.
+
+### Local encrypted copies: `backup-pull`
+
+`mac/backup-pull/` keeps a copy of the server's databases on whichever machine runs it (Linux or macOS), checked,
+rotated and **encrypted**, once a day. Settings are in a `.env` next to it (`.env.example` explains every line).
+
+| `SOURCE=` | What you get | What it needs | Where it's safe |
+|---|---|---|---|
+| `bucket` | last night's off-site backups, copied from the bucket (every atlas database, plus any app's own backups) | a key that can only **read and list** the bucket (Scaleway IAM: ObjectStorageObjectsRead + ObjectStorageBucketsRead, no expiry; you create it, it isn't part of the bootstrap) | any machine: the key can't change or delete anything, and it keeps working when the server is down |
+| `live` | a fresh dump of every atlas database **right now** (the nightly job's `mariadb-dump` options), as the read-only `atlas_backup` user, over SSH | the server's SSH key and `ATLAS_BACKUP_PASSWORD` | only machines you'd trust with the SSH key, which is root on the server |
+| `both` | live, then bucket | both | |
+
+**Encrypted as it streams in.** The dumps hold every site's users (emails, password hashes), so every file is
+encrypted with [age](https://age-encryption.org) to `AGE_RECIPIENT` (preset to `ANVIL_AGE_RECIPIENT`, the **public**
+half of the age key that protects the repo's secrets) while it arrives. No plaintext copy is ever written to disk, and
+the dump check runs on the stream too. **The backup machine can't read its own copies**: it holds only the public
+key, so a stolen laptop or a synced copy of the folder reveals nothing. Only the private key decrypts them; never put
+it on a backup machine.
+
+**Checked.** Each dump must be an intact gzip ending in mariadb-dump's `-- Dump completed` line, or nothing of it is
+kept. A live run writes into `<time>.part` and renames it only when every database checked out. Bucket mode fetches
+only files this machine doesn't have yet, one at a time (`rclone cat` straight into age), so the read-only key is
+enough.
+
+**Kept** under `DEST` (default `~/<name>-backups`): `live/` 30 days, `daily/` 90 days (at least 31: the bucket itself
+keeps 30), `monthly/` forever.
+
+**Scheduled** by `install.sh`: an hourly check that runs `pull.sh --daily` once a day, so a machine that was off
+catches up when it's back. On Linux a systemd user timer (with `loginctl enable-linger`, so it runs without you
+logged in), or a crontab line without systemd; on macOS a launchd agent. `./install.sh remove` undoes it. A failure is
+logged in `pull.log` and, with `WEBHOOK_TOKEN` and `STATUS_URL` set, posts a line to the error latch. On the home
+machine: `scripts/home-deploy backup-pull`, write its `.env`, run `~/<name>-backup-pull/install.sh` there (with
+`SOURCE=bucket`). On your own machine: `SOURCE=live` is fine.
+
+Restore from a copy on the operator's machine (the private key is there):
+
+```sh
+age -d -i ~/.config/sops/age/keys.txt -o .data/<ns>/db.sql.gz ~/<name>-backups/live/<time>/<db>.sql.gz.age
+scripts/node.sh restore-db <ns>
+```
+
+### A moved database's own backup
+
+While a project's database lives on its own server ([Scale a site out](/operations/scale-out/)), atlas's nightly
+dump only holds the frozen (or following) copy. So the cutover creates a CronJob `<ns>-mariadb-backup` in the
+project's namespace (03:50 UTC, the same image, bucket and write-only key, `component: backup`, so `backup-watch` and
+`/backups` check it like the others) and runs it once at once. It uploads to its own folder,
+`daily/<date>/mariadb-<ns>/` (`BACKUP_SOURCE`), never over atlas's files of the same name. The move back deletes it.
+
+### SQLite
+
+Copying a live SQLite file can copy it mid-write. The backup job uses SQLite's **online `.backup`** command, which
+produces a consistent snapshot while the app keeps running, then uploads it with the volume's other files. The job
+runs as its own UID but joins the app's group (`fsGroup`), so it can read the volume.
+
+## Restoring
+
+Restore one project, never the whole server: [Restore a database](/operations/restore-database/).
+
+<Aside type="note" title="Not backed up off-site">
+File volumes (uploads, screenshots) are not in the nightly backup. Decide per app whether its files need a backup job
+of their own (label it `component: backup`).
+</Aside>

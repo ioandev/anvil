@@ -1,0 +1,57 @@
+---
+title: anvil
+description: A reproducible one-server platform for many small projects, run with Claude Code as the operator.
+template: splash
+hero:
+  tagline: One cheap server, a dozen side projects, no ops team. Flatcar + k3s on Scaleway behind Cloudflare, one shared database, secrets in git, backups the server can't delete, phone calls when something breaks, and a Claude Code autopilot that fixes the easy incidents.
+  actions:
+    - text: What anvil is
+      link: overview/
+      icon: right-arrow
+      variant: primary
+    - text: Quickstart
+      link: quickstart/
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components'
+
+anvil is the generic, reproducible version of a personal server that has run about 20 real projects
+since October 2026: websites, APIs, Discord bots and cron jobs on one Scaleway VM. Everything in it was built and is
+operated with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as the operator, following written rules.
+
+<CardGrid>
+  <Card title="Locked-down edge" icon="padlock">
+    Only Cloudflare can reach the origin: a firewall limited to Cloudflare's ranges **and** a client certificate
+    from your own CA. No ACME and no Cloudflare token on the server.
+  </Card>
+  <Card title="Data you can't lose" icon="database">
+    One shared MariaDB with two least-privilege users per project; nightly off-site dumps uploaded with a key that
+    can write but never list, read or delete.
+  </Card>
+  <Card title="Told when it breaks" icon="phone">
+    Prometheus, Alertmanager and blackbox probes, phone calls through Twilio, and a watchdog on a second machine
+    for when the server itself is gone.
+  </Card>
+  <Card title="An autopilot with guardrails" icon="rocket">
+    Claude Code in a container that diagnoses an incident and may only restart, roll back, re-run a job or delete one
+    stuck pod, then writes a post-mortem.
+  </Card>
+  <Card title="Secrets in git" icon="code-branch">
+    SOPS + age: plaintext gitignored, encrypted twins committed, a pre-commit hook that refuses stale or leaked
+    secrets. One key is the root of trust.
+  </Card>
+  <Card title="Reproducible" icon="server">
+    Terraform + Butane for the node, one manifest per project, `sites.yaml` as the single list of sites. A fresh
+    server is a rebuild, not an archaeology project.
+  </Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid>
+  <LinkCard title="Architecture" description="The request, backup, alert and autopilot paths in four diagrams." href="/architecture/" />
+  <LinkCard title="Decisions" description="Why Scaleway, Flatcar + k3s, Cloudflare Free, one MariaDB, SOPS, phone calls." href="/decisions/" />
+  <LinkCard title="Operations" description="Runbooks: deploy, add a site, restore, rotate, silence, remove, rebuild." href="/operations/deploy-app/" />
+  <LinkCard title="Lessons learned" description="The outages, self-inflicted pages and traps behind each rule." href="/lessons/" />
+</CardGrid>

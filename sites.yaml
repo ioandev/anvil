@@ -1,0 +1,120 @@
+# sites.yaml: the one place that says which sites, hosts, zones, databases, probes and UIDs this platform has.
+#
+# ${ANVIL_*} values come from anvil.env (scripts/anvil_env.py); quote any value that contains one.
+# Read by scripts/sites.py (library + CLI) and through it by make-secrets.py, node.sh, origin-certs.py,
+# cloudflare-zones.py and new-site. `python3 -I scripts/sites.py render` rewrites the generated parts of
+# platform/www/app.yaml, platform/origin-ca/app.yaml and CLAUDE.md; `... check` compares the manifests with this file.
+#
+# A new site: `scripts/new-site init <ns> <host>` (adds an entry here and writes apps/<ns>/app.yaml), then
+# `scripts/new-site plan|apply <ns>`. docs: Operations → Add a site.
+
+server_ip: "${ANVIL_SERVER_IP}"   # written to anvil.env by the 30-infra step (terraform output public_ip)
+next_uid_block: 6020              # a new project takes the next free block of 10; bump this when you take it
+
+# Cloudflare zones served here: each gets an Origin CA cert (zone + *.zone) and a TLSStore entry.
+# records: names cloudflare-zones.py looks up and mirrors when it creates the zone ("@" = apex).
+zones:
+  "${ANVIL_DOMAIN}": {records: ["@", www, demo, status, _dmarc]}
+
+# One entry per namespace (the CLAUDE.md table follows this order).
+#   tier        platform (the shared stack, platform/<ns>/) or app (a project, apps/<ns>/)
+#   hosts       public hostnames its Ingresses answer (check: the manifests use no others)
+#   www         apex hosts whose www.<host> 301s to the apex (platform/www)
+#   probes      URLs checked through Cloudflare every 30 s (SiteDown); every part that can fail on its own
+#   metrics     in-cluster host:port/path Prometheus scrapes for the app's own metrics (optional)
+#   db          its database in the shared MariaDB (atlas), users <ns>_rw / <ns>_ro
+#   uids        UID/GID ranges its containers may use (check: every runAsUser is inside one)
+#   generate    keys of apps/<ns>/prod.env that scripts/anvil-secrets fills with random values (Secret <ns>)
+#   configmaps  ConfigMaps built from repo files at deploy: {name: folder-or-file}
+#   notes       shown in the CLAUDE.md table;  uid_notes: UIDs used outside the cluster or reserved
+#   scripted    true: the namespace is created and deleted by a script (no app.yaml), e.g. a load-test copy
+#   move        the project's database and apps can move to its own pool (scripts/move-db): pool, uid, storage,
+#               buffer_pool, memory, workloads, maintenance {service, uid}, backup_uid, volumes [{deployment, claim,
+#               size, uid}] (local volumes that move with the app: scripts/move-db volumes-out|volumes-back)
+#   loadtest    a throwaway copy for k6 (scripts/loadtest): host, manifest, seed, k6, check, rows, image_from
+#   edge_cache  every public site's decision (rule 19): false (say why in a comment), or {ttl: <s>} = Cloudflare answers
+#               anonymous visitors (no cookie, no Authorization, not /api) for ttl seconds. Optional: hosts, exclude
+#               (path prefixes never cached: live streams, admin), allow_api (public read-only /api prefixes),
+#               ttl_by_host, ttl_paths {exact path: s}, warm (paths the edge-warmer keeps fresh; default /),
+#               purge_on_change {db, query}: the edge-purger purges the zone when the query's answer changes.
+#               Apply: scripts/cloudflare-cache-rules.py, then scripts/sites.py render + node.sh deploy edge-warmer.
+namespaces:
+  anvil-demo:
+    tier: app
+    hosts: ["demo.${ANVIL_DOMAIN}"]
+    probes: ["https://demo.${ANVIL_DOMAIN}/", "https://demo.${ANVIL_DOMAIN}/readyz"]
+    metrics: ["anvil-demo-web.anvil-demo:9090/metrics", "anvil-demo-worker.anvil-demo:8081/metrics"]
+    db: anvil_demo
+    uids: [6000-6009]
+    generate: [ADMIN_TOKEN]
+    # The guestbook shows approved entries, the same for every visitor: Cloudflare serves it for 30 s, and the
+    # edge-purger purges it as soon as the worker approves a new entry. The form posts to /api (never cached).
+    edge_cache:
+      ttl: 30
+      exclude: [/admin, /healthz, /readyz, /metrics]
+      purge_on_change: {db: anvil_demo, query: "SELECT COUNT(*), MAX(approved_at) FROM entries WHERE approved_at IS NOT NULL"}
+    # Scale-out (scripts/pool, scripts/move-db; docs: Operations → Scale a site out): its own server (the `demo` pool,
+    # billed hourly, off by default) with its database moved there live and a brief API cutoff.
+    move:
+      pool: demo
+      uid: 6005                     # anvil-demo-mariadb, its own database server while moved
+      storage: 10Gi
+      buffer_pool: 512M
+      memory: 1Gi
+      workloads: [deploy/anvil-demo-web, deploy/anvil-demo-worker]
+      maintenance: { service: anvil-demo-web, uid: 6006 }   # the 503 responder during a cutover
+      backup_uid: 6007              # its nightly off-site backup while moved
+    # Load tests (scripts/loadtest anvil-demo up|run|down; CAPACITY.md): a copy on the demo pool, behind a password,
+    # with generated data and its own database (namespace anvil-demo-loadtest, exists only during a test).
+    loadtest:
+      host: "demo-loadtest.${ANVIL_DOMAIN}"
+      manifest: apps/anvil-demo/loadtest.yaml.tpl
+      seed: apps/anvil-demo/loadtest-seed.sql
+      k6: loadtest/anvil-demo
+      check: /api/entries
+      rows: 50000
+      image_from: anvil-demo-web
+    uid_notes: {6005: "anvil-demo-mariadb: its own database server when moved (scripts/move-db)", 6006: "anvil-demo-web-maintenance: the 503 responder during a cutover", 6007: "anvil-demo-mariadb-backup: its nightly off-site backup while moved"}
+    notes: "the demo app: guestbook + worker, with a break switch for live demos"
+  anvil-demo-loadtest:
+    tier: app
+    scripted: true                # made and deleted by scripts/loadtest from apps/anvil-demo/loadtest.yaml.tpl
+    uids: [6010-6019]
+    uid_notes: {6010: "its MariaDB (generated data only)", 6011: "web", 6012: "worker"}
+    notes: "the demo's load-test copy (scripts/loadtest anvil-demo): exists only during a test, on the demo pool, behind a password; its host has no probe on purpose (usually absent)"
+  webhook:
+    tier: platform
+    hosts: ["status.${ANVIL_DOMAIN}"]
+    uids: [5050-5059]
+    configmaps: {webhook-hooks: platform/webhook/hooks, autopilot-viewer: platform/webhook/autopilot-viewer}
+    edge_cache: false     # status endpoints: always live
+    notes: "webhookd: status endpoints, error latch, autopilot links"
+  alerting:
+    tier: platform
+    uids: [5490-5499]
+    uid_notes: {5490: "also the home machine's watchdog container"}
+    notes: "internal; tailnet: Alertmanager :8443, Prometheus :9443, Grafana :3443"
+  atlas:
+    tier: platform
+    uids: [5450-5459, 5480, 5483]
+    notes: "internal: atlas-mariadb.atlas:3306, the shared MariaDB"
+  autopilot-access:
+    tier: platform
+    notes: "the autopilot's narrow cluster login (ServiceAccount, RBAC, an admission policy; no pods)"
+  edge-warmer:
+    tier: platform
+    uids: [5540-5549]
+    notes: "keeps Cloudflare's cache of every edge_cache site warm, and purges a site when its content changes"
+  dozzle:
+    tier: platform
+    uids: [5410-5419]
+    notes: "Tailscale only (no DNS, Service or Ingress)"
+  origin-ca:
+    tier: platform
+    notes: "Origin CA certs → Traefik's default TLSStore (no pods)"
+  www:
+    tier: platform
+    notes: "www.<domain> → apex (one IngressRoute, no pods; built from each site's `www:`)"
+
+# Never reuse: removed projects' UIDs.
+retired_uids: []

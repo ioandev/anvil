@@ -1,0 +1,72 @@
+---
+title: Add a site
+description: One entry in sites.yaml plus a manifest; scripts/new-site does the zone, certificate, www redirect, probes, database users and the cutover.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Adding a site is **an entry in `sites.yaml` + a manifest**; `scripts/new-site` does the rest. No Terraform, no
+Butane, no node changes.
+
+<Steps>
+
+1. **Create it**
+
+   ```sh
+   scripts/new-site init <ns> <host> [--db] [--image IMG] [--port N] [--health /healthz]
+   ```
+
+   - takes the next free UID block (`next_uid_block` in `sites.yaml`) and adds the namespace: hosts, `www:` (for an
+     apex), one probe, `db:` with `--db`, the UID block; a new zone gets an entry under `zones:`;
+   - writes `apps/<ns>/app.yaml` from `scripts/templates/app.yaml.tpl`, which already follows every
+     [rule](/reference/app-rules/): own UID/GID, `enableServiceLinks: false`, readiness + liveness probes, a
+     project-prefixed Service, a Traefik Ingress on `websecure` with `tls.hosts` and no `certresolver`, the standard
+     labels;
+   - with `--db`, adds `<NS>_RW_PASSWORD` / `<NS>_RO_PASSWORD` to `anvil.env` (`scripts/anvil-secrets init` generates them).
+
+2. **Make it real**: edit the manifest for the real app (image, env, volumes) and add a probe in `sites.yaml` for
+   **each part that can fail on its own** (API health route, websocket service…). Secrets go in
+   `apps/<ns>/prod.env`. Then `python3 -I scripts/sites.py check` must show 0 errors.
+
+3. **See the plan, then run it**
+
+   ```sh
+   scripts/new-site plan <ns>      # prints every step; changes nothing
+   scripts/new-site apply <ns>     # runs them, stopping on the first failure
+   ```
+
+   The steps: check → render (www route, TLSStore, the docs table) → Cloudflare zone + origin pulls
+   (`cloudflare-zones.py`) → Origin CA cert (`origin-certs.py`) → `make-secrets.py` → `node.sh atlas-users` (with a
+   database) → `node.sh deploy origin-ca www alerting <ns>` → **stop for a new zone** → `cutover.py` →
+   `node.sh curl` per host.
+
+4. **A new domain needs a person** (apply asks before the cutover):
+   - move the domain's nameservers to **the pair Cloudflare reports for this zone** (they differ per zone); with
+     registrar API access this can be scripted, otherwise it goes into `HUMAN.md`;
+   - wait until the zone is active **and** `GET /zones/<id>/ssl/certificate_packs` shows a pack `active`;
+   - check `https://dns.google/resolve?name=<host>&type=A`; if Google still has the old answer, flush it at
+     https://developers.google.com/speed/public-dns/cache.
+
+   Then answer `y` and the cutover runs. Rollback: `scripts/cutover.py --rollback <old-ip> <host>…`.
+
+5. **Done means watched**: `https://status.example.com/cluster?code=…` must be 200 with the new probes in it. Commit
+   `sites.yaml`, `apps/<ns>/`, the generated files and the re-encrypted `anvil.env.sops`
+   (`make secrets-encrypt`; the pre-commit hook runs `sites.py check`).
+
+</Steps>
+
+<Aside type="tip" title="A path on an existing host">
+A site can also live under a path of another site's host (`example.com/tool`): give its Ingress a `path` and bake
+the base path into the app at build time (Next.js `basePath`, Astro `base`). This documentation site is served that
+way. Probes then use the full URL (`https://example.com/tool`).
+</Aside>
+
+## Why each step exists
+
+| Step | Skipping it caused |
+|---|---|
+| unique UID block | image defaults like UID 999 collide between unrelated images |
+| project-prefixed Service | a generic `backend:4000` round-robined across three projects' stacks (a real outage) |
+| a probe per part | a home page loads while its API is dead, and nothing calls |
+| edge certificate before cutover | every HTTPS handshake through Cloudflare fails for minutes |
+| Google DNS check | visitors see the old server for up to two days |

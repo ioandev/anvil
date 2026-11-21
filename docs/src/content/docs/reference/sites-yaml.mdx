@@ -1,0 +1,173 @@
+---
+title: sites.yaml format
+description: The single source of truth for zones, hosts, www redirects, probes, metrics, databases, generated secrets, ConfigMaps, UID blocks, edge caching, database moves and load tests, and what reads it.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+`sites.yaml` (repo root) says which sites, hosts, zones, databases, probes and UIDs the platform has. Before it
+existed (on the server anvil came from), the same facts were repeated across half a dozen scripts and manifests and
+drifted. The manifests themselves stay hand-written: `sites.yaml` describes them, and `sites.py check` proves they
+agree. `${ANVIL_*}` values come from `anvil.env`; **quote any value that contains one** (rule 18).
+
+## anvil's file (abridged)
+
+```yaml
+server_ip: "${ANVIL_SERVER_IP}"   # written to anvil.env by 30-infra
+next_uid_block: 6020              # a new project takes the next free block of 10; bump it when you take one
+
+zones:                            # each gets an Origin CA cert (zone + *.zone) and a TLSStore entry
+  "${ANVIL_DOMAIN}": {records: ["@", www, demo, status, _dmarc]}   # names cloudflare-zones.py mirrors
+
+namespaces:
+  anvil-demo:
+    tier: app
+    hosts: ["demo.${ANVIL_DOMAIN}"]
+    probes: ["https://demo.${ANVIL_DOMAIN}/", "https://demo.${ANVIL_DOMAIN}/readyz"]
+    metrics: ["anvil-demo-web.anvil-demo:9090/metrics", "anvil-demo-worker.anvil-demo:8081/metrics"]
+    db: anvil_demo
+    uids: [6000-6009]
+    generate: [ADMIN_TOKEN]
+    edge_cache:                   # Cloudflare answers anonymous visitors for 30 s (rule 19)
+      ttl: 30
+      exclude: [/admin, /healthz, /readyz, /metrics]
+      purge_on_change: {db: anvil_demo, query: "SELECT COUNT(*), MAX(approved_at) FROM entries WHERE approved_at IS NOT NULL"}
+    move:                         # its own server when it outgrows this one (scripts/pool, scripts/move-db)
+      pool: demo
+      uid: 6005                   # anvil-demo-mariadb
+      storage: 10Gi
+      buffer_pool: 512M
+      memory: 1Gi
+      workloads: [deploy/anvil-demo-web, deploy/anvil-demo-worker]
+      maintenance: { service: anvil-demo-web, uid: 6006 }
+      backup_uid: 6007
+    loadtest:                     # a throwaway copy for k6 (scripts/loadtest)
+      host: "demo-loadtest.${ANVIL_DOMAIN}"
+      manifest: apps/anvil-demo/loadtest.yaml.tpl
+      seed: apps/anvil-demo/loadtest-seed.sql
+      k6: loadtest/anvil-demo
+      check: /api/entries
+      rows: 50000
+      image_from: anvil-demo-web
+    notes: "the demo app: guestbook + worker, with a break switch for live demos"
+  anvil-demo-loadtest:
+    tier: app
+    scripted: true                # made and deleted by scripts/loadtest: no app.yaml
+    uids: [6010-6019]
+  webhook:
+    tier: platform
+    hosts: ["status.${ANVIL_DOMAIN}"]
+    uids: [5050-5059]
+    configmaps: {webhook-hooks: platform/webhook/hooks, autopilot-viewer: platform/webhook/autopilot-viewer}
+    edge_cache: false             # status endpoints: always live
+  alerting:
+    tier: platform
+    uids: [5490-5499]
+    uid_notes: {5490: "also the home machine's watchdog container"}
+  atlas:
+    tier: platform
+    uids: [5450-5459, 5480, 5483]
+  edge-warmer: {tier: platform, uids: [5540-5549]}
+  dozzle:     {tier: platform, uids: [5410-5419]}
+  origin-ca:  {tier: platform}
+  www:        {tier: platform}
+
+retired_uids: []                  # never reuse: removed projects' UIDs
+```
+
+**UID blocks:** the platform keeps the 5000s it had on the original server; projects start at **6000** (the demo
+has 6000–6009 and its load-test copy 6010–6019, so the next project takes 6020).
+
+## Keys
+
+### Top level
+
+| Key | Meaning |
+|---|---|
+| `server_ip` | the server's public IP (cutovers) |
+| `next_uid_block` | first UID of the next free block of 10 |
+| `zones` | zone → `{records: [...], note?}`; `records` are the names `cloudflare-zones.py` looks up and mirrors when it creates the zone (`"@"` = apex) |
+| `namespaces` | namespace → entry (below); their order is the order of the generated table in `CLAUDE.md` |
+| `retired_uids` | UIDs that must never be used again |
+
+### Per namespace
+
+| Key | Meaning | Used by |
+|---|---|---|
+| `tier` | `platform` (`platform/<ns>/`) or `app` (`apps/<ns>/`) | every script (`nsdir`) |
+| `hosts` | public hostnames its Ingresses answer | `check` (manifests use no others), `sites.py hosts` for `cutover.py` |
+| `www` | apex hosts whose `www.<host>` 301s to the apex | `render` (the shared route in `platform/www`) |
+| `probes` | URLs checked through Cloudflare every 30 s (`SiteDown`): every part that can fail on its own | `make-secrets.py` → Prometheus' `sites` job; `check` (rule 13) |
+| `metrics` | in-cluster `host:port/path` Prometheus scrapes for the app's own metrics (optional) | `make-secrets.py` → scrape jobs |
+| `db` | its database in atlas; users `<ns>_rw` / `<ns>_ro` | `make-secrets.py` (`atlas-db` Secret), `node.sh atlas-users` / `restore-db`, `anvil-secrets` (passwords) |
+| `uids` | UID/GID ranges (`a-b`) or single UIDs its containers may use | `check` (every `runAsUser`/`runAsGroup` inside one) |
+| `generate` | keys of `apps/<ns>/prod.env` that `anvil-secrets` fills with random values (they end up in the Secret `<ns>`) | `anvil-secrets init` |
+| `configmaps` | ConfigMaps built from repo files at deploy: `{name: folder-or-file}` | `node.sh deploy` (and the config-hash restart, rule 16) |
+| `notes`, `uid_notes` | shown in the generated table; UIDs used outside the cluster or reserved | `render` |
+| `scripted` | `true`: the namespace is created and deleted by a script and has no `app.yaml` (a load-test copy); `check` skips the manifest, `make-secrets.py` writes no Secrets for it | `check`, `make-secrets.py` |
+| `edge_cache` | the site's edge-cache decision: `false` (say why in a comment) or a block ([below](#edge_cache)); `check` warns about a public app without one | `cloudflare-cache-rules.py`, `cloudflare-purge`, `render` (the edge-warmer's lists), `edge-cache-monitor` |
+| `move` | the project's database and apps can move to their own pool ([below](#move)) | `move-db`, `pool`, `render` (atlas's `--binlog-do-db`), `anvil-secrets`, `node.sh atlas-users` |
+| `loadtest` | a throwaway copy for k6 ([below](#loadtest)) | `loadtest` |
+| `db_host` | the database host written into the `atlas-db` Secret instead of `atlas-mariadb.atlas`; set by `move-db <ns> use-alias` to the alias `<ns>-db.<ns>`, so redeploys keep it. Don't set it by hand | `make-secrets.py`, `move-db` |
+
+### `edge_cache`
+
+[Edge caching](/components/edge/#edge-caching). Cached only for anonymous visitors: `GET`/`HEAD`, no `Cookie`, no
+`Authorization`, not Next.js navigation, not `/api` unless allowed.
+
+| Key | Meaning |
+|---|---|
+| `ttl` | seconds Cloudflare serves a page from its cache (default 30) |
+| `hosts` | which of the namespace's hosts (default: all of them) |
+| `exclude` | path prefixes never cached: live streams, websockets, admin pages, health checks |
+| `allow_api` | path prefixes under `/api` that are public and read-only, and may be cached |
+| `ttl_by_host` | `{host: seconds}` for a host that needs its own time |
+| `ttl_paths` | `{exact path: seconds}` for a page that needs its own time (a home page listing new posts) |
+| `warm` | paths the edge-warmer keeps fresh (default `/`) |
+| `purge_on_change` | `{db, query}`: the edge-purger runs the query as `<ns>_ro` every 30 s and purges the zone when its answer changes |
+
+After a change: `python3 -I scripts/sites.py render`, `python3 scripts/cloudflare-cache-rules.py`,
+`scripts/node.sh deploy edge-warmer`.
+
+### `move`
+
+[Scale a site out](/operations/scale-out/).
+
+| Key | Meaning |
+|---|---|
+| `pool` | the pool (in `infra/pools.auto.tfvars`) its database and apps move to |
+| `uid` | the UID of its own MariaDB while moved (from the project's block, with a `uid_notes` line) |
+| `storage`, `buffer_pool`, `memory` | that MariaDB's volume, InnoDB buffer pool and memory limit (defaults 10Gi, 256M, 512Mi) |
+| `workloads` | the workloads that use the database (`deploy/<name>`), for the cutover |
+| `maintenance` | `{service, uid}`: the Service pointed at a 503 "back in a moment" responder during the cutoff, and its UID |
+| `backup_uid` | the UID of its nightly off-site backup while moved |
+| `volumes` | optional: the app's local volumes to move with it (`volumes-out`/`volumes-back`) |
+
+A project with `move:` gets `<NS>_REPL_PASSWORD` and `<NS>_DB_ROOT_PASSWORD` from `anvil-secrets init`, a `<ns>_repl`
+login from `atlas-users`, and its database in atlas's binary log (one atlas restart to apply).
+
+### `loadtest`
+
+[Load-test a site](/operations/load-test/#describing-a-sites-copy-loadtest): `host`, `manifest`, `seed`, `k6`,
+`check`, `rows`, `image_from`, and optionally `pool` (default: the one from `move:`). The copy's namespace
+(`<ns>-loadtest`) needs its own entry with `scripted: true` and a UID block.
+
+## What reads it
+
+| Command | Does |
+|---|---|
+| `python3 -I scripts/sites.py render` | rewrites the generated blocks: the `www` IngressRoute (`platform/www/app.yaml`), the TLSStore list (`platform/origin-ca/app.yaml`), the sites/UID table in `CLAUDE.md` |
+| `python3 -I scripts/sites.py check` (also `make check` and the pre-commit hook) | hosts; UIDs inside blocks; unique Service names; `enableServiceLinks: false`; liveness probes; probes present; standard labels (partly); generated parts current |
+| `sites.py hosts <ns>` / `db <ns>` / `dbs` / `zones` | small queries for other scripts |
+| `python3 -I scripts/sites.py render` (more) | also the edge-warmer's URL and purge lists (`platform/edge-warmer/app.yaml`) and atlas's `--binlog-do-db` lines |
+| `make-secrets.py` | probes and scrape targets, Origin CA zones, `atlas-db` and app Secrets |
+| `node.sh` | `deploy-all` order, ConfigMaps, `atlas-users`, `restore-db`, the zone to purge after a deploy |
+| `cloudflare-cache-rules.py`, `cloudflare-purge`, `edge-cache-monitor` | `edge_cache` |
+| `pool`, `move-db`, `loadtest` | `move`, `loadtest` |
+| `origin-certs.py`, `cloudflare-zones.py` | zones |
+| `new-site init` | adds an entry, takes `next_uid_block` |
+
+<Aside type="note">
+Generated blocks are fenced with `BEGIN generated from sites.yaml by scripts/sites.py render` / `END generated`
+comments: edit `sites.yaml`, not the block. After any change: `python3 -I scripts/sites.py render && make check`.
+</Aside>

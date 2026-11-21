@@ -1,0 +1,35 @@
+---
+import Diagram from './Diagram.astro'
+const boxes = [
+  { x: 20, y: 20, w: 200, h: 66, title: 'blackbox exporter', lines: ['every site via Cloudflare, 30 s'] },
+  { x: 20, y: 100, w: 200, h: 66, title: 'kube-state-metrics', lines: ['every Deployment, pod, Job'] },
+  { x: 20, y: 180, w: 200, h: 66, title: 'status webhook', lines: ['/overall: disk, DB, backups'] },
+  { x: 260, y: 82, w: 170, h: 100, title: 'Prometheus', lines: ['rules, most with for: 5m', 'ignores 10-min-old', 'work in progress'] },
+  { x: 470, y: 82, w: 190, h: 100, title: 'Alertmanager', lines: ['silences (tailnet UI)', 're-sends every 5 min', 'sends "resolved"'] },
+  { x: 470, y: 236, w: 190, h: 118, kind: 'accent', title: 'twilio-alert', lines: ['calls at 5, 7, 9, 11, 15… min', 'quiet hours, then hourly', 'pick up = 60 min pause', 'autopilot hold ≤ 20 min'] },
+  { x: 260, y: 254, w: 170, h: 82, kind: 'ok', title: 'Twilio → phone', lines: ['voicemail does not', 'count as answered'] },
+  { x: 470, y: 408, w: 190, h: 82, title: 'webhookd', lines: ['/am_heartbeat (15 min)', '/watchdog for the Mac'] },
+  { x: 20, y: 408, w: 330, h: 82, kind: 'danger', title: 'Mac mini watchdog (off-box)', lines: ['GET /watchdog every minute; calls if', 'unreachable 10 min or no heartbeat 2 h'] },
+]
+const edges = [
+  { d: 'M220,53 L258,110' },
+  { d: 'M220,133 H258' },
+  { d: 'M220,213 L258,160' },
+  { d: 'M430,132 H468' },
+  { d: 'M565,182 V234', kind: 'accent' },
+  { d: 'M470,295 H432', kind: 'accent' },
+  { d: 'M660,120 H690 V449 H662', kind: 'dash' },
+  { d: 'M350,449 H468', kind: 'dash' },
+  { d: 'M320,408 V338', kind: 'danger' },
+]
+const labels = [
+  { x: 697, y: 290, text: 'Watchdog' },
+  { x: 697, y: 306, text: 'alert' },
+  { x: 360, y: 440, text: 'pull' },
+  { x: 328, y: 380, text: 'own Twilio call' },
+]
+---
+<Diagram id="alr" width={770} height={506} boxes={boxes} edges={edges} labels={labels}
+  title="Alert path"
+  desc="Probes, cluster state and the status webhook feed Prometheus; rules fire to Alertmanager, which hands them to twilio-alert, which phones the owner through Twilio. An always-firing Watchdog alert keeps a heartbeat on the webhook, which a watchdog on a separate Mac pulls every minute; it calls on its own if the server or its alerting is gone."
+  caption="Alert path: the server watches its apps; a second machine watches the server. Nothing on the server connects to the Mac." />

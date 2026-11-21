@@ -1,0 +1,49 @@
+---
+title: 'Decision: phone calls, not email'
+description: Why alerts ring a phone through Twilio on a schedule, with quiet hours, an off-box watchdog and the autopilot's grace period.
+---
+
+**Status:** accepted (2026-10-24).
+
+## Context
+
+An API once sat **three days** unable to start with nothing calling. Emails and chat messages are read
+when convenient, which for a side project means "later". The owner wanted to be woken for real outages, not for a
+deploy in progress.
+
+## Decision
+
+Firing alerts ring the owner's **phone** through Twilio (`twilio-alert`), on a schedule: the rules wait 5 minutes (`for: 5m`), then the
+first call comes 2 minutes after the alert arrives (~7.5 minutes after the problem started), then 4, 6, 8, 12, 17, 22, 32,
+47, 62 minutes, then hourly; if the autopilot is working, calls are held (at most 20 min), and **if it gives up, the
+phone rings at once**; no calls in quiet hours (they wait);
+picking up pauses calls 60 minutes; **voicemail doesn't count**. A second machine runs its own watchdog that calls
+when the server itself is gone. Email is kept for things that can wait (backup reports).
+
+## Consequences
+
+- + Incidents get noticed within minutes, at night too (outside quiet hours).
+- + The 5-minute grace absorbs blips and gives the autopilot a chance first; the hold while it works is capped
+  (20 minutes, once per incident), so it can't hide an incident.
+- − **False alarms are expensive** (sleep), which forced better rules: ignore work in progress 10 minutes, `for: 5m`,
+  only count pods that still exist, `zz-` naming for tests.
+- − Self-inflicted pages happened: a new exporter's wrong liveness port paged twice; expiring a silence early
+  resent a stale alert. Both are now rules and runbooks.
+- − Twilio costs a little per number and per call.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| Email / chat notifications | ignorable; the three-day outage happened with them |
+
+## How it was decided
+
+- Status pages came first, "like the old server had": plain HTTP endpoints the owner's existing cron checker polls,
+  with a bare 500 unless the code is given, and a stale report counting as red.
+- Then "call me if anything is wrong". Alertmanager only says firing/resolved; the **schedule** lives in twilio-alert
+  (bursts then hourly, quiet hours, a 60-minute pause after picking up), which Alertmanager's repeat intervals couldn't
+  express.
+- The answer semantics changed three times, the last during a real test at night (the owner wanted voicemail to keep
+  calling). Only a live end-to-end test made the requirement clear.
+- The 5-minute first-call grace came with the autopilot, so it can fix the easy ones before anyone wakes up.

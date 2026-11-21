@@ -1,0 +1,57 @@
+---
+title: Image tags
+description: One tag convention for every image - build date plus commit, never reused, never latest - and how multi-arch images are published.
+---
+
+## The convention
+
+| Tag | When | Example |
+|---|---|---|
+| `<YYYYMMDD>-<short sha>` | a build of a clean commit (date in UTC) | `20261027-83f3c56` |
+| `<YYYYMMDD>-<short sha>-<n>` | another build of the same clean commit the same day (`--suffix n`) | `20261027-83f3c56-2` |
+| `<YYYYMMDD>-<short sha>-dirty-<HHMMSS>` | built with uncommitted changes: **test only, never released** | `20261027-83f3c56-dirty-141502` |
+
+`scripts/image-tag [dir] [--suffix N]` prints the tag for a checkout (`dir` defaults to the current directory).
+
+Rules:
+
+- Tags **sort by date** and **name the exact source**.
+- A tag is never reused or moved. **No `:latest`**: a manifest always says exactly what runs, and a rollback is
+  a revision that names an image that still exists.
+- Set the `app.kubernetes.io/version` label in the manifest to the same value.
+- Mixed conventions (`0.0.16`, a bare sha, `<sha>-deps<date>`, `20261024f`) on the original platform are why this
+  exists: a rebuild from a sha or a version string didn't say when, or whether the tree was clean.
+
+## Building: `make images`
+
+`make images` runs `scripts/build-images anvil-backup=platform/backup twilio-alert=images/twilio-alert anvil-demo=demo`.
+For each image it:
+
+1. computes the tag with `scripts/image-tag` and **refuses a dirty tree** (commit first);
+2. builds `twilio-alert` for **amd64 + arm64** under one tag (the home machine's watchdog runs it), the others amd64;
+3. pushes to `$ANVIL_REGISTRY/<name>:<tag>` (a private Scaleway registry namespace created by `40-platform`);
+4. records the tag in `anvil.env` (`ANVIL_BACKUP_TAG`, `ANVIL_TWILIO_TAG`, `ANVIL_DEMO_TAG`), which the manifests use as
+   `${ANVIL_…_TAG}`;
+5. deletes the local per-arch copies (disk: only the registry keeps them).
+
+It stops on the first failure: a manifest must never point at an image that wasn't pushed (that happened once on the
+original platform, and only the rolling update's "keep the old pod until the new one is ready" kept the site up).
+
+The node pulls with credentials written to `/etc/rancher/k3s/registries.yaml` on first boot (`registry_password` = the
+Scaleway secret key). The autopilot image is built from its own repo (`./build.sh`, the same multi-arch scheme).
+
+## Images for the home machine
+
+The home machine may be arm64 (a Mac mini) while the server is amd64. Its images are built on the laptop (arm64
+through qemu: slow but works), pushed as one multi-arch tag so they aren't stored only there, and shipped with
+`scripts/home-deploy`, which loads them with `podman save … | ssh … docker load` (the home machine has no registry
+login).
+
+## Updating every app
+
+The `update-images` skill (`.claude/skills/update-images/`) updates every app's packages, rebuilds and publishes its
+images with these tags (one subagent per repo, never deploying), writes a confirmation file
+with what changed and a recommendation per app, and **releases nothing until you approve** ("pushing = releasing =
+deploying"). Its `repos.yaml` lists each repo and the images it builds; keep it current. On the original platform
+the first sweep (18 repos, 36 images) also found production running code that git didn't have: an app whose real
+code was never committed, another built from a months-old branch.

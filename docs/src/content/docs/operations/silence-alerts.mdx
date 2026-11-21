@@ -1,0 +1,67 @@
+---
+title: Silence or stop alerts
+description: Mute alerts for maintenance, stop calls that already started, pause the autopilot, and remove silences without getting called again.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+## Before planned work
+
+| You want | Do |
+|---|---|
+| no calls about one thing for a while | Alertmanager UI (tailnet: `https://<node>.<tailnet>.ts.net:8443`) → **New Silence**, matcher `alertname="<Name>"` (and `namespace=…`), an end time |
+| no calls at all, **including the off-box watchdog** (server reboot, rebuild) | silence `alertname="Watchdog"` too: `/watchdog` then returns `mutedUntil` and the Mac stays quiet until then, even if the server disappears |
+| the autopilot to keep its hands off | `GET https://status.example.com/autopilot_pause?code=…&minutes=60` (10–120); calls are **not** paused by this |
+| to deploy without being called | nothing: rules ignore a workload changed in the last 10 minutes, then wait 5 more |
+
+## Stop calls that already started
+
+A silence stops **new** notifications. It does **not** stop twilio-alert's schedule for an incident that is
+already open: it keeps calling until it receives "resolved" (or 20 minutes without updates). Options:
+
+1. **Pick up the phone.** Answering (even silently) pauses calls for 60 minutes. Voicemail doesn't count.
+2. **Send it "resolved"** from inside the cluster (the key is the alert name):
+
+   ```sh
+   scripts/node.sh kubectl -n alerting exec -i deploy/alerting-prometheus -- sh -c 'read -r pw; wget -qO- \
+     --header "Content-Type: application/json" \
+     --post-data "{\"alerts\":[{\"status\":\"resolved\",\"labels\":{\"alertname\":\"<Name>\"}}]}" \
+     "http://alerting-twilio:3000/alert?password=$pw"' <<< "$SERVICE_PASSWORD"
+   ```
+
+   (`SERVICE_PASSWORD` from `platform/alerting/prod.env`; it's passed on stdin so it never appears in a process
+   list.)
+
+3. Check the pager is calm: `GET http://alerting-twilio:3000/pager?password=…` (in-cluster) should show
+   `"problems":[]`.
+
+## Removing a silence safely
+
+<Aside type="danger" title="This called the owner a third time">
+A Prometheus that restarted while an alert was firing never sends "resolved" for it, so Alertmanager keeps the
+alert until it times out. Expire the silence before that and the stale alert goes straight to the phone.
+</Aside>
+
+<Steps>
+
+1. Check Alertmanager no longer holds the alert:
+
+   ```sh
+   scripts/node.sh kubectl -n alerting exec deploy/alerting-alertmanager -- \
+     amtool alert query --alertmanager.url=http://localhost:9093
+   ```
+
+2. If it's still listed, **let the silence run out** instead of expiring it.
+3. At the end, `GET /pager` shows `"problems":[]`.
+
+</Steps>
+
+## A test call
+
+`POST http://alerting-twilio:3000/test-call?password=…` (in-cluster) places one call and never pauses real alerts.
+Ask before using it on someone else's phone.
+
+## Throwaway tests page too
+
+`zz-…` workloads are hidden from Grafana's overview but **not** from the alerts: a test that's broken for 10 minutes
+calls you. Delete it before then (`kubectl delete namespace zz-…`), or silence it **and** send "resolved" as above.

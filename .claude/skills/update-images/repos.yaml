@@ -1,0 +1,29 @@
+# Catalogue for the update-images skill: every app this platform (and the home machine) runs whose source you have
+# locally. Keep it in step with apps/*/app.yaml.
+#
+# Per repo:
+#   path:      the git repo (absolute path on this machine)
+#   images:    what it builds. name = image name; context = build context (relative to the repo);
+#              dockerfile = path to the Dockerfile if not <context>/Dockerfile; args = build args;
+#              target = Dockerfile stage; platforms = linux/amd64 unless listed (an arm64 home machine needs arm64)
+#   live:      the image the platform runs now, and in which manifest
+#   notes:     things a subagent must know (test commands, migrations, what never to run)
+#
+# Everything is published to $ANVIL_REGISTRY/<name>:<tag> (anvil.env), tagged <YYYYMMDD>-<sha> (scripts/image-tag).
+
+repos:
+  anvil-demo:
+    path: ../anvil/demo          # replace with the absolute path of your clone
+    images:
+      - { name: anvil-demo, context: . }
+    live: "anvil-demo:${ANVIL_DEMO_TAG} in apps/anvil-demo/app.yaml (web + worker)"
+    notes: >-
+      Node.js LTS + TypeScript. `npm ci && npm run build && npm test`. The schema setup must keep working with the
+      previous release still running (rolling deploys).
+  twilio-alert:
+    path: ../anvil/images/twilio-alert
+    images:
+      - { name: twilio-alert, context: ., platforms: [linux/amd64, linux/arm64] }
+    live: "twilio-alert:${ANVIL_TWILIO_TAG} in platform/alerting/app.yaml and on the home machine (mac/watchdog)"
+    notes: >-
+      Places phone calls. Never place a real call while testing (POST /test-call only with the owner's OK).

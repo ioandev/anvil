@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Re-encrypt changed secrets into their .sops twins and stage them; refuse to commit if a plaintext secret would be
+# committed, or if sites.yaml and the manifests disagree. Enabled by `make hooks`.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+scripts/secrets.sh encrypt >/dev/null
+git add -- $(git ls-files --others --modified --exclude-standard -- '*.sops' 'secrets/') 2>/dev/null || true
+scripts/secrets.sh check
+python3 -I scripts/sites.py check >/dev/null || { python3 -I scripts/sites.py check | grep -E '^ERROR'; echo "pre-commit: fix the above"; exit 1; }

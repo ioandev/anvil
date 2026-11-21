@@ -1,0 +1,23 @@
+# OpenBao (open-source Vault fork): passwords and keys, on the Mac mini, tailnet only.
+# Master copy: mac/openbao/ ; on the Mac: ~/${ANVIL_NAME}-openbao/ (this file, config.hcl, seal.key).
+# UI + API: https://${ANVIL_HOME_TAILNET_HOST}:${ANVIL_HOME_BAO_PORT} (Tailscale serve -> 127.0.0.1:${ANVIL_HOME_BAO_PORT}; never published elsewhere).
+services:
+  openbao:
+    image: docker.io/openbao/openbao:2.7.2
+    container_name: ${ANVIL_NAME}-openbao
+    command: ["server", "-config=/openbao/config/config.hcl"]
+    ports: ["127.0.0.1:${ANVIL_HOME_BAO_PORT}:8200"]          # loopback only: Tailscale serve adds HTTPS for the tailnet
+    volumes:
+      - ./config.hcl:/openbao/config/config.hcl:ro
+      - ./seal.key:/openbao/seal/seal.key:ro   # static auto-unseal key (32 bytes); encrypted copy in the repo
+      - openbao-data:/openbao/file             # Raft storage + audit log (all encrypted except the audit log's metadata)
+    environment:
+      BAO_ADDR: "http://127.0.0.1:8200"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8200/v1/sys/health?standbyok=true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  openbao-data:

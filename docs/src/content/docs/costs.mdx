@@ -1,0 +1,78 @@
+---
+title: Costs
+description: What anvil costs - the hourly and monthly line items, what's free, the cost-saving choices, and what an autopilot run costs.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+<Aside type="caution" title="Approximate, at the time of writing">
+These are the estimates `00-preflight` prints, from October 2026. Prices change: check
+[scaleway.com/en/pricing](https://www.scaleway.com/en/pricing/), Twilio's and Anthropic's price pages before relying on
+them. VAT may not be included.
+</Aside>
+
+## Line items
+
+| Item | Price (approximate) | Notes |
+|---|---|---|
+| Server, DEV1-L (4 vCPU / 8 GB / 80 GB local SSD) | ≈ €0.04/hour, **≈ €30/month** | the local SSD is included; no block volumes (a list price of €31.27/month was seen when choosing it) |
+| Flexible IPv4 | ≈ €0.004/hour, ≈ €3/month | kept on purpose: outbound IPv4 is needed and the IP survives rebuilds |
+| Object Storage | ≈ €0.015 per GB-month | backups are small (gzipped dumps); the vault's snapshots are tens of KB |
+| Container registry | first 75 GB free on private namespaces | |
+| Transactional Email | first 300 emails/month free | backup failures, the weekly OK, autopilot reports |
+| Cloudflare | €0 | Free plan: proxy, DNS, Origin CA, Authenticated Origin Pulls |
+| Tailscale | depends on your plan | only the server, your laptop and the home machine join |
+| Twilio | a few cents per call, plus the number | calls only when something is wrong |
+| Claude | per autopilot run: a few cents to ~$1 with Opus | cap it with the API key's spend limit |
+| Optional worker node | ~$10/month for a small instance | off by default (`agent_count = 0`) |
+| Node pool (optional), POP2-4C-16G | **about €0.147/hour** while it exists, plus its block disk (about €0.005/hour for 40 GB) | off by default (`count = 0`); only while a site is [scaled out](/operations/scale-out/) or a load test runs |
+| k6 machine (optional), POP2-2C-8G | about €0.0735/hour | exists only during a [load test](/operations/load-test/), deleted when the run ends |
+| Kept Flatcar image for pools | a few cents a month | after the first `scripts/pool up` |
+
+**Running for good: roughly €35 a month** (server + IP), plus cents for storage and calls.
+
+## Hourly billing
+
+Scaleway bills instances **by the hour, and every started hour in full**: a server that exists for one minute costs
+the whole hour, and a resize counts as a new hour at the new size. So:
+
+- plan pool work in **whole hours**, and keep one pool session for the day's work instead of `down` and `up` again
+  (each `up` is a new server and a new first hour);
+- delete the k6 machine as soon as the last run ends (`scripts/loadtest run` does);
+- `scripts/pool status` and the error latch's daily reminder (a pool node up over 12 hours) catch a forgotten server;
+- **never a bigger server, another pool or a second k6 machine without the owner's yes** (size, hourly price, and
+  that a resize restarts it): see [the money rules](/operations/scale-out/#the-money-rules).
+
+For scale: on the original server, a rehearsal, a first load test and a nine-run ceiling test took about two hours of
+hourly servers and cost **about €1.90** in total; **€0.44** of it came from two resizes that weren't needed (each
+started a new hour at a bigger size: the 16-core step ran 10 minutes and cost about €0.59 on its own).
+**Up for an hour and torn down: under €0.10 of Scaleway**, well under €1 in total.
+
+## Choices that keep it cheap
+
+- **One server for everything.** On the original platform, one 8 GB instance replaced four servers and runs about
+  20 projects.
+- **Local SSD as the root disk.** Included in the DEV1 price.
+- **One MariaDB instead of one per project.** Eleven instances used ~2 GB of RAM for 38 MB of data; merging them gave
+  back ~1.5 GB and avoided moving to a bigger instance (a 12 GB DEV1-XL was ~€47/month).
+- **A cache instead of more CPU.** When a blog was slow on the shared vCPUs, a 60-second Cloudflare cache for
+  anonymous visitors (and one missing database index in another app) fixed it, instead of a dedicated-CPU instance
+  (~€54/month). Every public site now gets an [edge-cache decision](/components/edge/#edge-caching); a crowd of
+  anonymous visitors is then Cloudflare's work, not the server's.
+- **Switch off the image pipeline after creation** (`make cleanup`): the bucket, the 13.2 GB snapshot and the image
+  are only needed to create a server.
+- **Image GC** at 75 % → 65 % disk, and pruning local images after pushing.
+- **Monitoring is small**: ~140 MB of RAM without Grafana, ~400 MB with it; no SaaS bill.
+- **Calls only for real incidents**: rules ignore work in progress and wait 5 minutes, then a 5-minute grace that often
+  lets the autopilot fix it first.
+
+## Autopilot cost per run
+
+A run is capped (15 minutes, 80 turns, `AUTOPILOT_MAX_RUNS_PER_DAY` runs a day: 15 in anvil's compose file), which
+caps the cost; runs no longer start on warnings, `notify` alerts or alerts pending under 2 minutes, which removed most
+of them on the original server. With Claude Opus 5.5 a run is roughly
+**$1–3 at most** (1–2 M mostly cached input tokens, ~30 K output: a rough estimate, not a measurement), so a $100
+budget covers 30–100 incidents; `00-preflight` quotes "a few cents to ~$1". The two real test runs on the original
+platform were short (13 turns in 2 min 18 s; 6 turns in 76 s). Small jobs (commit messages, post-mortems) can use a
+cheaper model: about $0.005 each with a small model versus ~$0.15 with Opus. With an API key, always set a **spend
+limit**; a subscription token instead uses the subscription's allowance.

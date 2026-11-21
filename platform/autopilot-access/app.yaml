@@ -1,0 +1,145 @@
+# autopilot-access: the autopilot's own, narrow cluster login, instead of root over SSH (HUMAN-TODO A1). The home
+# machine's autopilot uses a kubeconfig for the ServiceAccount below (scripts/node.sh autopilot-kubeconfig, kept in
+# OpenBao at ops/kube/autopilot), reaching the API over the tailnet only (port 6443 is closed to the internet).
+#
+# What the cluster itself allows (so the autopilot's guard is no longer the only lock):
+#   - read: workloads, pods and their logs, events, nodes, services, ingresses, volumes claims, metrics. NOT Secrets,
+#     NOT exec / attach / port-forward / proxy.
+#   - write, exactly the autopilot's repairs: patch Deployments/StatefulSets/DaemonSets (rollout restart, rollout
+#     undo), create Jobs (re-run a CronJob), delete Pods (one stuck pod).
+#   - and the ValidatingAdmissionPolicy below: its workload changes may roll back (env and image included) but never
+#     add a Secret (volume, env, envFrom), a host path, a security setting, another service account or host access:
+#     a patch can't mount or print a Secret or raise privileges.
+# Left open on purpose (documented, docs: Components → Autopilot): a Job it creates could use a Secret its own
+# namespace's CronJobs already use; the guard only allows `create job <name> --from=cronjob/<cronjob>`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autopilot-access
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autopilot
+  namespace: autopilot-access
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+automountServiceAccountToken: false
+---
+# A long-lived token for the kubeconfig (rotate: delete this Secret and deploy again, then re-run
+# scripts/node.sh autopilot-kubeconfig and put the result in OpenBao).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: autopilot-token
+  namespace: autopilot-access
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  annotations: { kubernetes.io/service-account.name: autopilot }
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: anvil-autopilot
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  # read (no secrets)
+  - apiGroups: [""]
+    resources: [pods, pods/log, events, nodes, services, endpoints, configmaps, namespaces, persistentvolumeclaims,
+                persistentvolumes, serviceaccounts, resourcequotas, limitranges, replicationcontrollers]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets, statefulsets, daemonsets, controllerrevisions]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses, networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io, discovery.k8s.io, policy, autoscaling, storage.k8s.io, traefik.io]
+    resources: ["*"]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]   # kubectl top
+    resources: [pods, nodes]
+    verbs: [get, list]
+  # the repairs
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [patch]                # rollout restart, rollout undo
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [create]               # create job --from=cronjob/...
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [delete]               # one stuck pod
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: anvil-autopilot
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: anvil-autopilot }
+subjects: [{ kind: ServiceAccount, name: autopilot, namespace: autopilot-access }]
+---
+# Its workload changes may restart and roll back (a rollback can change env and image: it returns to what was deployed
+# before), but never GAIN anything: no Secret, host path or projected volume, no Secret in env/envFrom, no security
+# setting the workload didn't already have, no other service account or host access.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: anvil-autopilot-repairs-only
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [apps]
+        apiVersions: ["*"]
+        operations: [UPDATE]
+        resources: [deployments, statefulsets, daemonsets]
+  matchConditions:
+    - name: the-autopilot
+      expression: request.userInfo.username == "system:serviceaccount:autopilot-access:autopilot"
+  variables:
+    - name: new
+      expression: object.spec.template.spec
+    - name: old
+      expression: oldObject.spec.template.spec
+    - name: oldAll   # every container the workload had, init containers included
+      expression: "variables.old.containers + (has(variables.old.initContainers) ? variables.old.initContainers : [])"
+    - name: newAll
+      expression: "variables.new.containers + (has(variables.new.initContainers) ? variables.new.initContainers : [])"
+  validations:
+    - expression: >-
+        !has(variables.new.volumes) || variables.new.volumes.all(v,
+          !(has(v.secret) || has(v.projected) || has(v.hostPath)) || (has(variables.old.volumes) && v in variables.old.volumes))
+      message: "the autopilot may not add a Secret, projected or host-path volume"
+    - expression: >-
+        variables.newAll.all(c, !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)
+          || variables.oldAll.exists(o, has(o.envFrom) && e in o.envFrom)))
+      message: "the autopilot may not add a Secret to a container's envFrom"
+    - expression: >-
+        variables.newAll.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)
+          || variables.oldAll.exists(o, has(o.env) && e in o.env)))
+      message: "the autopilot may not add a Secret to a container's env"
+    - expression: >-
+        variables.newAll.all(c, !has(c.securityContext)
+          || variables.oldAll.exists(o, has(o.securityContext) && o.securityContext == c.securityContext))
+      message: "the autopilot may not give a container a security context it didn't have"
+    - expression: >-
+        (has(variables.new.serviceAccountName) ? variables.new.serviceAccountName : "") == (has(variables.old.serviceAccountName) ? variables.old.serviceAccountName : "")
+        && (has(variables.new.securityContext) ? variables.new.securityContext : {}) == (has(variables.old.securityContext) ? variables.old.securityContext : {})
+        && (has(variables.new.hostNetwork) ? variables.new.hostNetwork : false) == (has(variables.old.hostNetwork) ? variables.old.hostNetwork : false)
+        && (has(variables.new.hostPID) ? variables.new.hostPID : false) == (has(variables.old.hostPID) ? variables.old.hostPID : false)
+        && (has(variables.new.hostIPC) ? variables.new.hostIPC : false) == (has(variables.old.hostIPC) ? variables.old.hostIPC : false)
+      message: "the autopilot may not change a pod's service account, security context or host access"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: anvil-autopilot-repairs-only
+  labels: { app.kubernetes.io/part-of: autopilot-access, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+spec:
+  policyName: anvil-autopilot-repairs-only
+  validationActions: [Deny]

@@ -1,0 +1,280 @@
+---
+title: Scale a site out
+description: Give one project its own server for a while - a node pool billed by the hour, its database moved there live with a brief cutoff, direct mode, the emergency rescue, monitoring, and the money rules. The demo is the worked example.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+When one project outgrows the shared server, it can get a server of its own for as long as it needs one: a **node
+pool** that joins the cluster as a k3s agent. Its website and workers move there with ordinary rolling restarts, and
+its database is copied to its own MariaDB there **while the site keeps running**, follows atlas live, and takes over
+during a **brief cutoff of about 10 seconds**, when the project's API answers "back in a moment". Visitors still come
+in through Cloudflare and the server's Traefik, which reaches the pool over the private network. Going back is the
+same steps in reverse, and the pool server is then deleted, so it stops costing money.
+
+On the original server this was built and rehearsed on a real project: 0 confirmed writes lost in three moves out and
+back with a writer inserting every 100 ms, and an API cutoff of 9.6–11.1 s each way.
+
+<Aside type="caution" title="Money first">
+A pool is billed **by the hour**, every started hour in full, and a resize starts a new billed hour at the new
+price. **Never create a pool, add a node, or pick a bigger type without the owner's yes**: say the size, its hourly
+price, and that a resize restarts the server. See [The money rules](#the-money-rules).
+</Aside>
+
+## When to do it
+
+- The server runs out of headroom **because of that project**: `/memory` under about 1 GB for long periods, its pods
+  the biggest users in `kubectl top pods`, its probes slowing at its busy hours while other sites are quiet.
+- Its database heads towards what the server's disk can hold (atlas's volume, the nightly dumps and the binary log
+  all live there).
+- A [load test](/operations/load-test/) shows it can't take the traffic you expect on the server, and can on a
+  bigger one.
+
+Not for a short spike: the first move is about an hour of work, and the pool costs money every hour it exists. For
+one evening, a slow site (or a longer [edge cache](/components/edge/#edge-caching)) is usually the better deal.
+
+## The moving parts
+
+| Piece | Where | What it does |
+|---|---|---|
+| Node pools | `infra/pools.tf`, `infra/pools.auto.tfvars` | each pool: `count` (0 = nothing exists, nothing is billed), `type`, `disk_gb`, `swap_mb`, `direct`. Block storage, so the type can change in place. Its nodes are labelled `anvil/pool=<name>` and `anvil/trusted=true` and tainted `anvil/dedicated=<name>:NoSchedule`, run the master's exact k3s version (`ANVIL_AGENT_K3S_VERSION`), and only SSH is open publicly |
+| `scripts/pool` | | switch a pool on and off, resize it, direct mode, rescue, the k6 machine |
+| atlas's binary log | `platform/atlas/app.yaml` | `--binlog-do-db` lines **generated from the projects with `move:`** in `sites.yaml`, ROW format, GTIDs in strict mode, kept 2 days |
+| `<ns>_repl` | `scripts/node.sh atlas-users` | the sync login: `REPLICATION SLAVE, BINLOG MONITOR`, plus read access on the project's own database only |
+| `<ns>-db` | a Service in the project's namespace | an ExternalName DNS alias the app uses as its database host (`db_host:` in `sites.yaml`, written into the `atlas-db` Secret); a cutover flips it, so the app isn't restarted |
+| `scripts/move-db` | | every database step (below) |
+| templates | `scripts/templates/move-db-*.yaml.tpl`, `pool-traefik.yaml.tpl` | the project's own MariaDB, the 503 responder, the moved database's nightly backup, the pool's own Traefik for direct mode |
+| `scripts/move-db-test` | | the whole move on throwaway pieces (namespace `zz-move`), with a writer that proves no confirmed write is lost |
+| `move:` | `sites.yaml` | the project's settings: `pool`, `uid` (its MariaDB), `storage`, `buffer_pool`, `memory`, `workloads`, `maintenance: {service, uid}`, `backup_uid`, optionally `volumes` |
+
+Pool nodes are **trusted**: they may pull from the registry and run pods with Secrets, and the `block-agents`
+NetworkPolicies don't refuse them (they do refuse the light node and any untrusted pool).
+
+### What is guaranteed
+
+- **No other project's data reaches the pool.** atlas's binary log holds only the movable projects' databases, so the
+  sync login can't see the others. User and password statements never enter the log (`atlas-users` and `move-db` run
+  with `sql_log_bin = 0`), and passwords travel only on stdin, never on disk or a command line.
+- **No confirmed write is lost at the cutover.** Before the switch, the app's login on the old server is locked and
+  its connections ended, then the new server is made to apply the old one's exact last change (a wait on the precise
+  GTID position, not "nearly in sync").
+- **A failed cutover changes nothing.** If anything fails before the switch (the copy is behind, the schemas differ,
+  the final sync doesn't arrive in time), the login is unlocked, the API reopens on atlas and it says
+  `ABORTING before the switch (…): reopening on atlas, nothing lost`.
+- **The moved database is backed up from its first hour**: the cutover creates its own nightly off-site backup and runs
+  it once at once ([details](/components/data/#a-moved-databases-own-backup)).
+
+## Node pools: `scripts/pool`
+
+| Command | Does |
+|---|---|
+| `scripts/pool status` | every pool: count, type, its nodes in the cluster |
+| `scripts/pool up <name>` | one node: imports the Flatcar block-storage image the first time (then kept), creates the server, waits until it is Ready in the cluster (about 80 s; the first time also the image import) |
+| `scripts/pool down <name>` | cordons the node, restarts the workloads that merely prefer it (they land on the server, rolling, no downtime), drains it, powers it off, deletes the server. **Refuses** while a moved database lives there, while direct mode is on, or while a load test exists |
+| `scripts/pool type <name> <type>` | resize in place (stop, migrate, start; disk, IP and cluster identity kept). **Refuses** without `POOL_TYPE_CONFIRMED=1`, which you set only after the owner said yes |
+| `scripts/pool direct <name> on\|off [--hosts=a,b]` | direct mode (below) |
+| `scripts/pool rescue <name>` | **emergency**, the pool node died (below) |
+| `scripts/pool loadgen up\|down` | the temporary k6 machine, outside the cluster, for [load tests](/operations/load-test/) |
+
+Every apply is a **targeted** plan that the script reads first: it refuses if anything outside the pool (the server,
+the light node, their IPs) would change, or anything but the pool would be destroyed. Terraform runs through the
+Makefile, so every `TF_VAR` comes from `anvil.env`. The script writes the count and type to
+`infra/pools.auto.tfvars`; commit it (and the re-encrypted state) afterwards.
+
+Workloads move to a pool by **preferring** it: a toleration for `anvil/dedicated=<pool>` and a *preferred* node
+affinity for `anvil/pool=<pool>`. With no pool node, nothing changes; with one, their next rollout lands there. The
+demo's web and worker have both.
+
+## Live database moves
+
+All database steps are subcommands of `scripts/move-db <ns>`:
+
+| Command | Does |
+|---|---|
+| `status` | where it stands: phase, replication running, lag, positions, schema hashes |
+| `use-alias` | once, ahead of time: the app reaches its database through the alias `<ns>-db`; sets `db_host` in `sites.yaml`, then `node.sh deploy <ns>` (one rolling restart) |
+| `prepare` | deploys `<ns>-mariadb` on the pool, read-only and empty, with its users and its backup login |
+| `seed` | a consistent copy from atlas while the site runs (no locks), with its exact position; refuses a non-empty target; runs inside the new pod, so a dropped SSH session doesn't stop it |
+| `follow` | live sync from that position: every change on atlas applied a moment later |
+| `cutover` | **the brief cutoff**: API answers 503, atlas login locked, final sync to the exact last change, the new MariaDB promoted, the alias flipped, API reopened, first backup run |
+| `back-follow` | atlas follows the new server (only this database), from the promotion point: the safety net |
+| `back` | the same cutoff the other way: the app returns to atlas, the moved backup job is removed |
+| `volumes-out` / `volumes-back` | the app's local volumes (`move.volumes`) to the pool and back: copy, switch the Deployment to the copy (rolling), copy again what changed meanwhile |
+| `remove` | deletes `<ns>-mariadb` and its volume (refused while it is the primary or the volumes are on the pool) |
+| `failover-to-atlas` | **emergency**: the pool died while atlas was following it; promotes atlas without it |
+
+### One-time preparation (no pool, no downtime)
+
+<Steps>
+
+1. **A `move:` block** on the project in `sites.yaml` (the demo's is the template): the pool, three UIDs from the
+   project's own block for its MariaDB, the 503 responder and the backup, each with a `uid_notes` line. Then
+   `python3 -I scripts/sites.py render && python3 -I scripts/sites.py check`.
+2. **A pool** for it in `infra/pools.auto.tfvars`, at `count = 0`. `make plan` shows only a security group added.
+3. **Passwords**: `scripts/anvil-secrets init` adds `<NS>_REPL_PASSWORD` and `<NS>_DB_ROOT_PASSWORD` for every project
+   with `move:`; then `scripts/node.sh atlas-users` and `make secrets-encrypt`.
+4. **atlas's binary log**: the project's database is now in the generated `--binlog-do-db` list; deploy atlas at a
+   quiet time (one restart; on the original server 598 of 598 requests to the site were answered meanwhile).
+5. **The alias**: `scripts/move-db <ns> use-alias`, then `scripts/node.sh deploy <ns>`. The app must read its database
+   host from the `atlas-db` Secret's `DB_HOST`.
+6. **The 503 responder** answers on `maintenance.service`'s ports with `503` and `Retry-After: 15`. With no separate API
+   Service (one container serves pages and API, like the demo), the whole site shows "back in a moment" for the
+   cutoff's seconds.
+7. **Placement**: the toleration and preferred affinity on each workload that should move.
+8. **A rehearsal**: with the pool up, `TEST_POOL=<pool> scripts/move-db-test 15000000` (about 2 GB of generated data
+   in a throwaway MariaDB, copied to a throwaway copy on the pool, followed, cut over and back with a writer running,
+   removed). It must end with `PASS: no confirmed write lost`. Its `seeded in … s` line, times ten, estimates a
+   20 GB copy.
+
+</Steps>
+
+### The day: moving out
+
+<Steps>
+
+1. `scripts/pool up <pool>`; check `scripts/pool status`.
+2. Roll the workloads that prefer the pool (`kubectl rollout restart`); singletons with `Recreate` are offline for a
+   few seconds. Workloads with local volumes: `scripts/move-db <ns> volumes-out`.
+3. Copy and follow, while the site runs normally:
+
+   ```sh
+   scripts/move-db <ns> prepare
+   scripts/move-db <ns> seed          # on the original server: 1.8 GB in 103 s over the private network
+   scripts/move-db <ns> follow
+   scripts/move-db <ns> status        # IO Yes, SQL Yes, 0 s behind, schema hashes equal
+   ```
+
+   It can follow for minutes or days; that costs only the pool's hourly price.
+4. **The cutover**: `scripts/move-db <ns> cutover`. It refuses unless the copy is at most 1 s behind, replication has no
+   error and both schemas are identical. What it prints, in order:
+
+   ```text
+   checks passed (lag 0 s, schema 91bf762bec5c78a1). CUTOFF STARTS
+   API CLOSED (503): service <api> -> <ns>-…-maintenance
+   writes stopped on atlas/atlas-mariadb-0; final sync up to 0-1-498
+   <ns>/<ns>-mariadb-0 promoted (its position (empty)); pointing the app at it
+   alias <ns>-db -> <ns>-mariadb.<ns>; waiting 6 s for DNS (TTL 5 s)
+   API reopened: service <api> -> <api>
+   moved. The copy on atlas stays read-only (login locked) as the way back
+   first off-site backup running (<ns>-mariadb-backup-<time>); waiting for it
+   first off-site backup done; nightly at 03:50 UTC, watched by backup-watch and /backups
+   ```
+
+   About 6 of the 10 seconds are the wait for the DNS alias to refresh. If the first backup fails it says so in
+   capitals: fix that at once.
+5. **Always, right after**: `scripts/move-db <ns> back-follow`. atlas then follows the new server live, limited to this
+   database. That's the safety net (`failover-to-atlas` needs it), and it makes the move back a 10-second cutoff at
+   any time.
+6. Check: `status` says `following-back` with 0 s lag; the site works; `/overall` is 200; `/backups` lists one more
+   backup. Write in `HUMAN.md` that the project is moved.
+
+</Steps>
+
+### Moving back
+
+```sh
+scripts/move-db <ns> status          # following-back, atlas 0 s behind
+scripts/move-db <ns> back            # the same cutoff the other way
+scripts/move-db <ns> volumes-back    # if volumes moved
+scripts/move-db <ns> remove          # deletes <ns>-mariadb and its volume
+scripts/pool down <pool>             # workloads back to the server (rolling), the server deleted
+```
+
+## Direct mode
+
+Normally every request goes Cloudflare → the server's Traefik → the pool. At high traffic the server's Traefik
+becomes the limit (on the original server's shared 4 vCPUs, roughly 900–1,000 requests a second in total, and a heavy
+test slows every other site). `scripts/pool direct <pool> on` takes the server out of the path:
+
+- the pool's security group opens 80/443 to **Cloudflare's ranges only**, as on the server, and a second Traefik
+  (`traefik-pool-<pool>`, the same image and trusted proxy ranges as the server's) runs on the pool with the same
+  Authenticated Origin Pulls, so only your zones complete a handshake;
+- it checks that every host answers through the pool **before** touching DNS (otherwise DNS is left as it was), then
+  points the hosts (`sites.py hosts <pool>`, or `--hosts=a,b`) at the pool, still proxied by Cloudflare.
+
+`off` points DNS back at the server, waits 30 s for open connections, removes the pool's Traefik and closes 80/443.
+`pool down` refuses while direct mode is on. Direct mode has no automatic way back: if the pool dies, use `rescue`.
+The pool's Traefik is scraped like the server's (Prometheus finds both by label), so the site alerts keep counting in direct mode.
+
+## Rescue: the pool node died
+
+`scripts/pool rescue <pool>` gets the pool's sites running on the server again, each step only where it applies:
+
+1. **DNS**: with direct mode on, the hosts go back to the server.
+2. **Databases**: a project in `following-back` fails over to atlas (`failover-to-atlas`: atlas has been following;
+   writes of the last fraction of a second may be missing). A project that is `moved` **without** atlas following is
+   not switched automatically: atlas holds only the state at the cutover, so it tells you to bring the node back or
+   restore from the moved database's last off-site backup (`daily/<date>/mariadb-<ns>/`).
+3. **Volumes** moved with `volumes-out` switch back to their originals (files written on the pool since are lost).
+4. **Pods**: the node is cordoned and its pods deleted, so they start again on the server.
+
+Then check the sites and `scripts/pool down <pool>` once the server can go. If the new server misbehaves but is up,
+`move-db <ns> back` is the calmer way out.
+
+## Monitoring
+
+- The site's probes go through Cloudflare as before; kube-state-metrics sees the new pods wherever they run.
+- `alerting-mysqld-exporter` (login `atlas_monitor`: status only) reads replication on atlas and every movable
+  project's own server. **`MovedDatabaseSafetyNetStopped` phones** when atlas stops following the moved database (the
+  safety net is gone); `MovedDatabaseReplicationStopped` (the copy stopped following atlas before a cutover: nothing
+  lost) and `MovedDatabaseReplicaLag` (over 30 s behind) are warnings.
+- **`PoolNodeDown` phones** after 2 minutes: if a site lives there, run `rescue`.
+- **A forgotten pool**: health-watch writes a line a day to the error latch for every pool node up for over 12 hours.
+- The node exporter runs on pool nodes too, so the [capacity alerts](/components/monitoring/#capacity-alerts-that-come-before-failures) cover them.
+
+See [Alert rules → Scale-out](/reference/alert-rules/#scale-out).
+
+## When things go wrong
+
+| Situation | Looks like | Do |
+|---|---|---|
+| `seed` fails | `seed failed (exit …)` and the copy's log | read the log; `remove`, then `prepare` and `seed` again |
+| replication stops with an error | `status`: `SQL No` and an error | usually a schema change made without `USE <db>` (not logged, by MariaDB's rules) or a write to the copy. Before the cutover: `remove` and start again. After it: stop and investigate first |
+| the copy is behind | `status`: many seconds behind | wait; `cutover` refuses until it's at most 1 s behind |
+| the cutover aborts | `ABORTING before the switch (…)` | nothing changed and nothing was lost: fix the reason and run it again |
+| the first backup fails | `THE FIRST BACKUP OF THE MOVED DATABASE FAILED` | the site runs; fix the backup at once (its Job's log); the nightly run retries at 03:50 UTC |
+| the pool node dies | `PoolNodeDown`, the site down | `scripts/pool rescue <pool>` |
+| `pool up` refuses | `the plan would change …, which is not part of a pool` | something outside the pool has pending changes (for example the server's `user_data`): apply those separately and deliberately first |
+| `pool down` refuses | a moved database, direct mode or a load test is there | `move-db … back`, `pool direct … off`, `loadtest … down` first |
+
+## The money rules
+
+Prices from Scaleway's public catalogue (`fr-par`, November 2026, excluding VAT; check before relying on them):
+
+| Server | Per hour |
+|---|---|
+| POP2-2C-8G (the k6 machine's default) | about €0.0735 |
+| **POP2-4C-16G** (the demo pool's default) | **about €0.147** |
+| POP2-8C-32G | about €0.29 |
+| POP2-16C-64G | about €0.59 |
+| block storage, per GB | about €0.00013 (a 40 GB disk is about €0.005/h) |
+
+- **Every started hour is billed in full**: a server that exists for one minute costs the whole hour, and a resize
+  counts as a new hour at the new size.
+- **Never a bigger server or another pool without the owner's yes.** Ask first, saying the size, its hourly price and
+  **that a resize restarts the server** (stop, migrate, start: about 30 s for the change and a minute until the node is
+  Ready, then every pod on it starts again). For a pool a site lives on, that's a planned outage: move back, resize,
+  move out again, unless the owner accepts the gap. An open-ended "get the best results" is not a yes. On the original
+  server a ceiling test resized a pool twice without asking: €0.44 of the €1.90 the testing cost.
+- **Plan in whole hours**: one pool session for the day's work (rehearsal, load tests), not `down` and `up` again.
+- **Delete the k6 machine as soon as the last run ends** (`scripts/loadtest` does it unless you pass `--keep`).
+- `scripts/pool status` and the daily error-latch reminder catch a forgotten server. With every pool down, only the
+  kept Flatcar image on block storage remains: a few cents a month.
+
+## The worked example: the demo
+
+The demo (`anvil-demo`) has a `move:` block for the pool `demo` (POP2-4C-16G, count 0): UID 6005 for its MariaDB,
+6006 for the 503 responder (on `anvil-demo-web`, so the whole demo shows "back in a moment" during the cutoff), 6007
+for its backup, 10 Gi of storage, a 512M buffer pool. Its web and worker prefer the pool. One hour of pool time
+(about €0.15 plus the disk) is enough to show the whole story:
+
+```sh
+scripts/pool up demo
+scripts/move-db anvil-demo use-alias && scripts/node.sh deploy anvil-demo   # once
+scripts/node.sh kubectl -n anvil-demo rollout restart deploy/anvil-demo-web deploy/anvil-demo-worker
+scripts/move-db anvil-demo prepare && scripts/move-db anvil-demo seed && scripts/move-db anvil-demo follow
+scripts/move-db anvil-demo cutover && scripts/move-db anvil-demo back-follow
+#   ... watch the site, load-test it (Operations → Load-test a site) ...
+scripts/move-db anvil-demo back && scripts/move-db anvil-demo remove
+scripts/pool down demo
+```

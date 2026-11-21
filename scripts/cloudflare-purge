@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Purge Cloudflare's cache for a site after it changes (docs: Components → Edge), so long edge TTLs never hide a release.
+
+  scripts/cloudflare-purge --ns <namespace>    the zones of the namespace's hosts, if any site there is edge-cached
+  scripts/cloudflare-purge <zone>...           those zones
+  scripts/cloudflare-purge --zones-for <ns>    only print which zones --ns would purge
+
+Purges everything in the zone (the free plan's purge-by-prefix doesn't exist; purge-everything is cheap: the
+edge-warmer refills the main pages within seconds). Called by scripts/node.sh deploy after every deploy. Runs on this
+machine only (the Cloudflare token never goes to the server).
+"""
+import json, os, pathlib, sys, urllib.request
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+import anvil_env  # noqa: E402
+import sites  # noqa: E402
+
+
+def token():
+    t = os.environ.get("CLOUDFLARE_API_TOKEN") or anvil_env.load().get("CLOUDFLARE_API_TOKEN")
+    if not t:
+        sys.exit("no CLOUDFLARE_API_TOKEN (anvil.env; scope incl. Cache Purge)")
+    return t
+
+
+def cf(m, p, b=None, tok=None):
+    r = urllib.request.Request("https://api.cloudflare.com/client/v4" + p, method=m, data=json.dumps(b).encode() if b is not None else None,
+                               headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(r, timeout=30) as x:
+            return json.load(x)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+
+
+def cached_zones():
+    s = sites.load()   # ${ANVIL_*} expanded
+    zones, out = list(s["zones"]), set()
+    for v in s["namespaces"].values():
+        ec = v.get("edge_cache")
+        for h in (ec.get("hosts") or v.get("hosts") or []) if ec else []:
+            out |= {z for z in zones if h == z or h.endswith("." + z)}
+    return s, zones, out
+
+
+def main():
+    a = sys.argv[1:]
+    s, zones, cached = cached_zones()
+    if a[:1] == ["--ns"] and len(a) == 2:
+        hosts = (s["namespaces"].get(a[1]) or {}).get("hosts") or []
+        targets = sorted({z for h in hosts for z in zones if (h == z or h.endswith("." + z)) and z in cached})
+    else:
+        targets = a
+    if a[:1] == ["--zones-for"] and len(a) == 2:   # just list them (node.sh deploy asks first)
+        hosts = (s["namespaces"].get(a[1]) or {}).get("hosts") or []
+        print(" ".join(sorted({z for h in hosts for z in zones if (h == z or h.endswith("." + z)) and z in cached})))
+        return
+    if not targets:
+        return
+    tok = token()
+    for z in targets:
+        found = cf("GET", f"/zones?name={z}", tok=tok).get("result") or []
+        if not found:
+            print(f"cloudflare-purge: {z}: no such zone")
+            continue
+        r = cf("POST", f"/zones/{found[0]['id']}/purge_cache", {"purge_everything": True}, tok=tok)
+        print(f"cloudflare cache purged: {z}" if r.get("success") else f"cloudflare-purge: {z}: {r.get('errors')}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,85 @@
+# Site config for the autopilot (its own repo, README there): the container on the home machine that runs Claude Code
+# when the platform's alerts stay on. ${ANVIL_*} come from anvil.env (rendered by the 70-autopilot step). Read from
+# this repo at run time (a copy on the home machine is the fallback). No secrets here: secret entries are vault refs.
+name: ${ANVIL_NAME}
+description: anvil (Flatcar + single-node k3s on Scaleway behind Cloudflare); manifests in platform/<ns>/app.yaml (shared stack) and apps/<ns>/app.yaml (projects).
+
+endpoints:                       # the watcher takes its own copies from env (mac/autopilot/docker-compose.yml)
+  alertmanager: https://${ANVIL_TAILNET_HOST}:8443
+  prometheus: https://${ANVIL_TAILNET_HOST}:9443
+  webhook: https://status.${ANVIL_DOMAIN}    # every GET needs ?code=<status code>; POSTs need X-Token
+status_paths: {overall: /overall, cluster: /cluster, changelog: /changelog, postmortem: /postmortem,
+               strict_check: "/cluster?strict=1"}   # "fixed" needs this to pass: no work-in-progress exceptions
+
+secrets:                         # OpenBao KV v2 (mount "secret"), read with the AppRole `claude`: path[#field]
+  status_code: ops/platform#STATUS_CODE
+  webhook_token: ops/platform#WEBHOOK_TOKEN
+  offsite: ops/home/openbao-offsite                # OFFSITE_BUCKET / OFFSITE_ACCESS_KEY / OFFSITE_SECRET_KEY (write-only)
+  email_api_key: ops/platform#BACKUP_S3_SECRET_KEY   # may send through Scaleway TEM
+  redact_prefix: ops/                             # every value under secret/ops/ is scrubbed from published records
+
+# No SSH and no root: the autopilot logs in to the cluster as its own ServiceAccount (platform/autopilot-access), over
+# the tailnet. The cluster itself lets it read (no Secrets, no exec) and make only its repairs, and refuses any change
+# that would give a workload a Secret, host access or more privilege. No age key either: it can't decrypt anything.
+kubectl:
+  kubeconfig: ops/kube/autopilot  # vault ref, field `kubeconfig` (scripts/node.sh autopilot-kubeconfig)
+manifests: "{platform,apps}/<ns>/app.yaml"    # for `kubectl diff -f - < <that file>` only: NEVER applied by the autopilot
+deploy: >-
+  The owner deploys with `scripts/node.sh deploy <ns>`. The autopilot never deploys (the repo is auto-committed and
+  may hold unreleased edits): it only uses rollout restart / rollout undo / create job --from=cronjob / delete one pod.
+
+# Extra refusals on top of the image's generic ones (regex over the whole command; reason shown to Claude).
+never:
+  - {match: '\bterraform\b|\bmake\s+(apply|destroy|plan|cleanup|apps|secrets\S*)\b', reason: "terraform and make targets are the owner's"}
+  - {match: 'cutover\.py|cloudflare-[a-z-]+\.py|origin-certs\.py|api\.cloudflare\.com', reason: "DNS and Cloudflare changes are the owner's"}
+  - {match: 'make-secrets\.py|secrets\.sh|\bsops\b\s+(?!-d\b|--decrypt\b)|\bsops\b.*\s(-i|--in-place|-e|--encrypt|set|edit)\b', reason: "secrets may be decrypted for reading, never edited or regenerated"}
+  - {match: 'node\.sh\b', reason: "scripts/node.sh needs the owner's SSH key, which the autopilot doesn't have: use kubectl"}
+  - {match: '\bkubectl\b[^|;&]*(\s-n\s*|--namespace[= ])atlas\b[^|;&]*\b(rollout\s+(restart|undo)|delete)\b|\bkubectl\b[^|;&]*\b(rollout\s+(restart|undo)|delete)\b[^|;&]*(\s-n\s*|--namespace[= ])atlas\b', reason: "the shared MariaDB (atlas) is read-only for the autopilot: report, don't restart or delete (re-running its backup CronJob is fine)"}
+  - {match: '\bmariadb\b[^|;&]*-u\s*root|MARIADB_ROOT_PASSWORD', reason: "no root database access"}
+  - {match: '\btailscale\s+(serve|funnel|down|logout|up)\b', reason: "Tailscale config is the owner's"}
+never_paths:                     # files Claude may not edit in its clone (it never deploys them anyway)
+  - "platform/atlas/*"
+  - "*.sops"
+  - "*prod.env"
+  - "anvil.env"
+  - "*.tf"
+  - "*.tfvars"
+  - "infra/*"
+  - "scripts/*"
+  - ".sops.yaml"
+  - "autopilot.yaml"
+  - "mac/autopilot/*"
+
+mac_containers: ["${ANVIL_NAME}-watchdog", "${ANVIL_NAME}-openbao"]
+
+age_recipient: ${ANVIL_AGE_RECIPIENT}   # .sops.yaml's public key: the raw transcript off-site
+offsite: {prefix: autopilot/, region: "${ANVIL_REGION}"}
+email:                           # Scaleway TEM HTTP API (as platform/backup/server-backup.sh does)
+  project_id: ${ANVIL_SCW_PROJECT_ID}
+  region: ${ANVIL_REGION}
+  from: autopilot@${ANVIL_DOMAIN}   # the domain must be verified in Scaleway TEM
+  from_name: ${ANVIL_NAME} autopilot
+  to: ${ANVIL_OWNER_EMAIL}
+
+claude:
+  max_turns: 80
+  model: claude-opus-5-5         # rare, high-stakes runs: the strongest model
+  effort: high                   # Opus 5.5 defaults to medium
+  tools: [Bash, Read, Skill, WebSearch]   # the only built-in tools the session gets
+
+notes: |
+  - No shell on the node: disk and memory from `$WEBHOOK_URL/space` and `/memory` (with the code) and Prometheus
+    (`node_filesystem_avail_bytes{mountpoint="/"}`, `node_memory_MemAvailable_bytes`, per node). The kubelet deletes
+    unused images by itself once the disk is 75% full.
+  - `kubectl diff` needs patch rights this login doesn't have (it may only patch workloads): to spot an unreleased
+    change, compare a workload's live image and env (`kubectl get deploy <name> -o yaml`) with its manifest in the repo.
+  - Shared MariaDB `atlas-mariadb.atlas:3306` (StatefulSet atlas/atlas-mariadb): every app depends on it. If it is
+    down, report; never restart, delete or exec into it. Read-only checks only (`/database` endpoint).
+  - Bots, cron jobs and queue workers are singletons (strategy Recreate, 1 replica): never scale them up.
+  - anvil-demo (the demo app): rollout restart/undo of anvil-demo-web is zero-downtime (2 replicas, rolling);
+    anvil-demo-worker is a singleton. Its /admin/break switch is how the owner stages incidents: fix the symptom
+    (restart/undo), never call /admin/break or /admin/fix yourself.
+  - openbao and ${ANVIL_NAME}-watchdog on the home machine: restart only if they are down (runs depend on openbao).
+  - Disk: `/space` turns red under 10 GB free. Kubelet image GC runs at 75%; `crictl rmi --prune` is safe.
+  - The alert rules already ignore workloads changed in the last 10 minutes (the owner's work in progress).
+  - Never use or create test accounts on production; never send emails or Discord messages to users.

@@ -1,0 +1,90 @@
+/* Diagrams are inline SVG drawn with Starlight's own colour tokens, so they follow the light/dark theme. */
+.dg {
+  margin: 1.5rem 0;
+}
+.dg svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 54rem;
+  font-family: var(--sl-font);
+}
+.dg figcaption {
+  margin-top: 0.5rem;
+  font-size: var(--sl-text-sm);
+  color: var(--sl-color-gray-3);
+}
+.dg .box {
+  fill: var(--sl-color-gray-6);
+  stroke: var(--sl-color-gray-4);
+  stroke-width: 1.5;
+}
+.dg .box.accent {
+  fill: var(--sl-color-accent-low);
+  stroke: var(--sl-color-accent);
+}
+.dg .box.danger {
+  fill: var(--sl-color-red-low);
+  stroke: var(--sl-color-red);
+}
+.dg .box.ok {
+  fill: var(--sl-color-green-low);
+  stroke: var(--sl-color-green);
+}
+.dg .zone {
+  fill: none;
+  stroke: var(--sl-color-gray-4);
+  stroke-width: 1.25;
+  stroke-dasharray: 6 5;
+}
+.dg text {
+  fill: var(--sl-color-white);
+  font-size: 15px;
+  font-weight: 600;
+}
+.dg text.sub {
+  fill: var(--sl-color-gray-2);
+  font-size: 12.5px;
+  font-weight: 400;
+}
+.dg text.lbl {
+  fill: var(--sl-color-gray-2);
+  font-size: 12px;
+  font-weight: 400;
+}
+.dg text.zlbl {
+  fill: var(--sl-color-gray-3);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.dg .edge {
+  fill: none;
+  stroke: var(--sl-color-gray-3);
+  stroke-width: 1.75;
+}
+.dg .edge.accent {
+  stroke: var(--sl-color-accent);
+}
+.dg .edge.danger {
+  stroke: var(--sl-color-red);
+  stroke-dasharray: 5 4;
+}
+.dg .edge.dash {
+  stroke-dasharray: 5 4;
+}
+.dg .head {
+  fill: var(--sl-color-gray-3);
+}
+.dg .head.accent {
+  fill: var(--sl-color-accent);
+}
+.dg .head.danger {
+  fill: var(--sl-color-red);
+}
+
+/* Landing page tweaks */
+.hero-tagline-list {
+  font-size: var(--sl-text-lg);
+}

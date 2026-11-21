@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Load-test a site safely: a throwaway copy of it on its pool, behind a password, with generated data, and k6 from a
+temporary machine in the same region (CAPACITY.md, docs: Operations → Load-test a site). Billed by the hour: the pool
+and the k6 machine both. Never against production's database.
+
+  scripts/loadtest <ns> up [--rows N]        deploy the copy (production's image, its OWN database on the pool), fill
+                                             it with generated data, point its hostname at the server
+  scripts/loadtest <ns> seed N               refill the copy's database with N generated rows (drops what is there)
+  scripts/loadtest <ns> run [script] [KEY=VALUE ...] [--keep] [--label=text]
+                                             create the k6 machine, run loadtest/<ns>/<script>.js (default mixed)
+                                             against the copy, write docs/loadtests/<date>-<ns>-<script>.md + .json
+                                             (results, both nodes' load every 10 s), delete the k6 machine (--keep: no)
+  scripts/loadtest <ns> scale web=N [worker=N]   replicas, between runs (finding the limit)
+  scripts/loadtest <ns> status               what exists, the password, the data
+  scripts/loadtest <ns> down                 delete the copy (namespace, volumes); the pool itself stays
+
+The site describes its copy in sites.yaml (`loadtest:` on its namespace): host, manifest (a template with ${LT_*}
+placeholders), seed (SQL with {N}), k6 (folder of scripts), check (a path that answers 200 once the copy works),
+rows (default), image_from (the production Deployment whose image the copy runs). The pool comes from its `move:`.
+Needs the pool up first (scripts/pool up <pool>) and down afterwards. While a run goes, every real site's probe is
+watched: the first failure, or a probe over 8 s twice in a row, stops k6 at once.
+"""
+import base64, datetime, hashlib, json, os, pathlib, re, secrets, subprocess, sys, threading, time, urllib.parse
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+os.chdir(ROOT)
+sys.path.insert(0, str(ROOT / "scripts"))
+import anvil_env  # noqa: E402
+import sites as sites_lib  # noqa: E402
+
+K6_IMAGE = "grafana/k6:2.2.0"
+
+
+def die(msg):
+    print(f"loadtest: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def say(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def kc(*args, input=None, check=True):
+    r = subprocess.run(["scripts/node.sh", "kubectl", *args], input=input, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"kubectl {' '.join(args[:4])}: {r.stderr.strip()[:400]}")
+    return r
+
+
+def env():
+    return anvil_env.load()
+
+
+def cfg(ns):
+    site = sites_lib.namespaces().get(ns) or die(f"no namespace {ns} in sites.yaml")
+    lt = site.get("loadtest") or die(f"{ns} has no `loadtest:` in sites.yaml")
+    pool = lt.get("pool") or (site.get("move") or {}).get("pool") or die(f"{ns}: no pool (loadtest.pool or move.pool)")
+    return {"ns": ns, "lt": f"{ns}-loadtest", "pool": pool, "host": lt["host"], "db": site.get("db", ""),
+            "tpl": pathlib.Path(lt["manifest"]), "seed": pathlib.Path(lt["seed"]) if lt.get("seed") else None,
+            "k6": pathlib.Path(lt.get("k6", f"loadtest/{ns}")), "check": lt.get("check", "/"),
+            "rows": int(lt.get("rows", 10000)), "image_from": lt.get("image_from", f"{ns}-web"),
+            "generate": site.get("generate") or []}
+
+
+def exists(c):
+    return kc("get", "namespace", c["lt"], check=False).returncode == 0
+
+
+def secret_value(c, name, key):
+    v = kc("-n", c["lt"], "get", "secret", name, "-o", f"jsonpath={{.data.{key}}}").stdout
+    return base64.b64decode(v).decode()
+
+
+def pool_ready(c):
+    items = json.loads(kc("get", "nodes", "-l", f"anvil/pool={c['pool']}", "-o", "json").stdout)["items"]
+    return any(x["type"] == "Ready" and x["status"] == "True" for n in items for x in n["status"]["conditions"])
+
+
+def mariadb(c, sql_text):
+    r = kc("-n", c["lt"], "exec", "-i", f"{c['lt']}-mariadb-0", "-c", "mariadb", "--", "sh", "-c",
+           f'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -B {c["db"]}', input=sql_text, check=False)
+    if r.returncode != 0:
+        die(f"SQL failed: {r.stderr.strip()[:600]}")
+    return r.stdout
+
+
+def secret(c, name, data, type_="Opaque"):
+    kc("-n", c["lt"], "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Secret", "type": type_,
+       "metadata": {"name": name, "namespace": c["lt"], "labels": {"app.kubernetes.io/part-of": c["lt"]}},
+       "stringData": data}))
+
+
+# --------------------------------------------------------------------------------------------------- up / seed / down
+
+def cmd_seed(c, rows):
+    if not c["seed"]:
+        die(f"{c['ns']}: no loadtest.seed in sites.yaml")
+    say(f"generating {rows} rows")
+    t0 = time.time()
+    print("   ", mariadb(c, c["seed"].read_text().replace("{N}", str(rows))).strip())
+    kc("annotate", "namespace", c["lt"], f"loadtest/rows={rows}", "--overwrite")
+    say(f"seeded in {time.time() - t0:.0f} s")
+
+
+def cmd_up(c, rows):
+    if not pool_ready(c):
+        die(f"no Ready node in pool {c['pool']}: scripts/pool up {c['pool']} first")
+    image = json.loads(kc("-n", c["ns"], "get", "deploy", c["image_from"], "-o", "json").stdout)["spec"]["template"]["spec"]["containers"][0]["image"]
+    mariadb_image = re.search(r"image:\s*(mariadb:\S+)", sites_lib.manifest("atlas")).group(1)
+    if exists(c):
+        say("already exists: keeping its passwords and data (scripts/loadtest <ns> seed N to refill)")
+    else:
+        kc("apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": c["lt"],
+           "labels": {"app.kubernetes.io/part-of": c["lt"], "app.kubernetes.io/managed-by": "anvil", "anvil/tier": "app",
+                      "anvil/loadtest": "true"}}}))   # scripts/pool down refuses while this label exists
+        auth_pw = secrets.token_urlsafe(18)
+        sha = base64.b64encode(hashlib.sha1(auth_pw.encode()).digest()).decode()
+        secret(c, f"{c['lt']}-db", {"MARIADB_ROOT_PASSWORD": secrets.token_hex(16)})
+        secret(c, "atlas-db", {"DB_HOST": f"{c['lt']}-mariadb", "DB_PORT": "3306", "DB_NAME": c["db"],
+                               "DB_USER": f"{c['ns'].replace('-', '_')}_rw", "DB_PASSWORD": secrets.token_hex(16)})
+        if c["generate"]:   # the app's own generated secrets: fresh random values, never production's
+            secret(c, c["ns"], {k: secrets.token_hex(24) for k in c["generate"]})
+        # Traefik's basic-auth secret must hold exactly one key: the password lives apart.
+        secret(c, f"{c['lt']}-auth", {"users": f"loadtest:{{SHA}}{sha}\n"})
+        secret(c, f"{c['lt']}-password", {"password": auth_pw})
+        pull = json.loads(kc("-n", c["ns"], "get", "secret", "anvil-registry", "-o", "json").stdout)
+        kc("-n", c["lt"], "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Secret", "type": pull["type"],
+           "metadata": {"name": "anvil-registry", "namespace": c["lt"]}, "data": pull["data"]}))
+    p = "      "
+    placement = (f"{p}imagePullSecrets: [{{ name: anvil-registry }}]\n"
+                 f"{p}nodeSelector: {{ anvil/pool: {c['pool']} }}\n"
+                 f"{p}tolerations: [{{ key: anvil/dedicated, operator: Equal, value: {c['pool']}, effect: NoSchedule }}]")
+    t = c["tpl"].read_text()
+    for k, v in {"LT_NS": c["lt"], "LT_HOST": c["host"], "LT_PLACEMENT": placement, "LT_IMAGE": image,
+                 "LT_MARIADB_IMAGE": mariadb_image, "LT_WEB_REPLICAS": "1"}.items():
+        t = t.replace("${" + k + "}", v)
+    t = anvil_env.expand(t, where=str(c["tpl"]))
+    if re.search(r"\$\{LT_[A-Z_]+\}", t):
+        die("template has unfilled ${LT_*} placeholders")
+    kc("apply", "-f", "-", input=t)
+    say(f"deployed ({image.split(':')[-1]}); waiting")
+    kc("-n", c["lt"], "rollout", "status", f"statefulset/{c['lt']}-mariadb", "--timeout=600s")
+    # A copy that can't start must not page anyone: the cluster-wide alerts see this namespace too and phone after 10
+    # minutes. Give up after 4 and scale it away.
+    for d in (f"{c['lt']}-web", f"{c['lt']}-worker"):
+        r = kc("-n", c["lt"], "rollout", "status", f"deploy/{d}", "--timeout=240s", check=False)
+        if r.returncode != 0:
+            pod = kc("-n", c["lt"], "get", "pod", "-l", f"app={d}", "-o", "name", check=False).stdout.split()
+            log = kc("-n", c["lt"], "logs", pod[0], "--all-containers", "--tail=15", check=False).stdout if pod else ""
+            kc("-n", c["lt"], "scale", f"deploy/{d}", "--replicas=0", check=False)
+            die(f"{d} didn't start in 4 minutes; scaled to 0 so it can't page anyone. Its log:\n{log[-1500:]}")
+    if c["seed"] and not kc("get", "namespace", c["lt"], "-o", "jsonpath={.metadata.annotations.loadtest/rows}", check=False).stdout:
+        cmd_seed(c, rows)
+    ip = env().get("ANVIL_SERVER_IP") or die("ANVIL_SERVER_IP missing in anvil.env")
+    r = subprocess.run(["python3", "-I", "scripts/cutover.py", ip, c["host"]], capture_output=True, text=True)
+    say(f"DNS {c['host']}: {(r.stdout or r.stderr).strip().splitlines()[-1] if (r.stdout or r.stderr).strip() else 'ok'}")
+    auth = secret_value(c, f"{c['lt']}-password", "password")
+    code = ""
+    for _ in range(30):
+        code = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-u", f"loadtest:{auth}",
+                               f"https://{c['host']}{c['check']}"], capture_output=True, text=True).stdout
+        if code == "200":
+            break
+        time.sleep(5)
+    say(f"https://{c['host']}{c['check']} answers {code} (user loadtest, password {auth})")
+
+
+def cmd_down(c):
+    if not exists(c):
+        say("nothing to delete")
+        return
+    kc("delete", "namespace", c["lt"], "--wait=true", "--timeout=300s", check=False)
+    say(f"deleted {c['lt']} and its volumes (the DNS record {c['host']} stays: Traefik answers 404 for it)")
+
+
+def cmd_status(c):
+    if not exists(c):
+        print(f"{c['lt']}: not deployed")
+        return
+    a = json.loads(kc("get", "namespace", c["lt"], "-o", "json").stdout)["metadata"].get("annotations", {})
+    print(f"{c['lt']}: rows {a.get('loadtest/rows', '?')}")
+    print(kc("-n", c["lt"], "get", "pods", "-o", "wide").stdout)
+    print(f"https://{c['host']}  user loadtest  password {secret_value(c, c['lt'] + '-password', 'password')}")
+
+
+def cmd_scale(c, args):
+    for kv in args:
+        k, _, v = kv.partition("=")
+        if k not in ("web", "worker") or not v.isdigit():
+            die("usage: scripts/loadtest <ns> scale web=N [worker=N]")
+        kc("-n", c["lt"], "scale", f"deploy/{c['lt']}-{k}", f"--replicas={v}")
+        kc("-n", c["lt"], "rollout", "status", f"deploy/{c['lt']}-{k}", "--timeout=300s")
+        say(f"{k}: {v} replicas")
+
+
+# --------------------------------------------------------------------------------------------------- run
+
+def ssh_key():
+    return os.path.expanduser(env().get("ANVIL_SSH_KEY", "~/.ssh/id_ed25519_anvil"))
+
+
+def cpu_counters(cmd):
+    """(steal, total, load1) from /proc/stat and /proc/loadavg over the given SSH command."""
+    r = subprocess.run(cmd + ["head -1 /proc/stat; cat /proc/loadavg"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2:
+        return None
+    v = [int(x) for x in lines[0].split()[1:]]
+    return v[7], sum(v[:8]), float(lines[1].split()[0])
+
+
+def sample(c, stop, out, pool_ip):
+    """Every 10 s: both nodes (kubectl top: CPU, memory; /proc: steal, load), the copy's pods and Traefik."""
+    node_ssh = ["scripts/node.sh", "ssh"]
+    pool_ssh = ["ssh", "-i", ssh_key(), "-p", env().get("ANVIL_SSH_PORT", "22"), "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5", f"core@{pool_ip}"]
+    prev = {}
+    while not stop.is_set():
+        t = time.time()
+        row = {"t": t, "nodes": {}, "pods": {}}
+        for l in kc("top", "nodes", "--no-headers", check=False).stdout.splitlines():
+            f = l.split()
+            if len(f) >= 5:
+                row["nodes"][f[0]] = {"cpu_m": int(f[1].rstrip("m")), "cpu_pct": int(f[2].rstrip("%")), "mem_mi": int(f[3].rstrip("Mi"))}
+        for ns, sel in ((c["lt"], []), ("kube-system", ["-l", f"app.kubernetes.io/name in (traefik,traefik-pool-{c['pool']})"])):
+            for l in kc("top", "pods", "-n", ns, "--no-headers", *sel, check=False).stdout.splitlines():
+                f = l.split()
+                if len(f) >= 3:
+                    name = re.sub(r"-[a-z0-9]{8,10}-[a-z0-9]{5}$", "", f[0])   # summed per workload, with the count
+                    w = row["pods"].setdefault(name, {"cpu_m": 0, "mem_mi": 0, "n": 0})
+                    w["cpu_m"] += int(f[1].rstrip("m")); w["mem_mi"] += int(f[2].rstrip("Mi")); w["n"] += 1
+        for name, cmd in (("server", node_ssh), ("pool", pool_ssh)):
+            cc = cpu_counters(cmd)
+            if cc and name in prev:
+                ds, dt = cc[0] - prev[name][0], cc[1] - prev[name][1]
+                row.setdefault("proc", {})[name] = {"steal_pct": round(100 * ds / dt, 1) if dt else 0, "load1": cc[2]}
+            if cc:
+                prev[name] = cc
+        out.append(row)
+        stop.wait(max(0, 10 - (time.time() - t)))
+
+
+def watch_sites(stop, events, kill):
+    """Protects the real sites: every 15 s, Prometheus's probes of every real site (through Cloudflare). The first
+    failure, or a probe slower than 8 s twice in a row, kills k6."""
+    slow = 0
+    while not stop.wait(15):
+        r = kc("-n", "alerting", "exec", "deploy/alerting-prometheus", "--", "wget", "-qO-",
+               "http://localhost:9090/api/v1/query?query=" + urllib.parse.quote(
+                   'probe_success{job="sites"} * 1000 + probe_duration_seconds{job="sites"}'), check=False)
+        try:
+            res = json.loads(r.stdout)["data"]["result"]
+        except Exception:  # noqa: BLE001
+            continue
+        failed = [x["metric"]["instance"] for x in res if float(x["value"][1]) < 1000]
+        worst = max((float(x["value"][1]) - 1000 for x in res if float(x["value"][1]) >= 1000), default=0)
+        events.append({"t": time.time(), "worst_probe_s": round(worst, 2), "failed": failed})
+        slow = slow + 1 if worst > 8 else 0
+        if failed or slow >= 2:
+            events.append({"t": time.time(), "stop": f"real site {'failed: ' + ', '.join(failed) if failed else f'probe {worst:.1f} s'}"})
+            say(f"STOPPING k6: {events[-1]['stop']}")
+            kill()
+            return
+
+
+def cmd_run(c, script, extra):
+    if not exists(c):
+        die(f"not deployed: scripts/loadtest {c['ns']} up first")
+    js = c["k6"] / f"{script}.js"
+    if not js.exists():
+        die(f"no {js}")
+    k6env = {"BASE": f"https://{c['host']}", "AUTH": f"loadtest:{secret_value(c, c['lt'] + '-password', 'password')}"}
+    keep = "--keep" in extra
+    label = next((x.split("=", 1)[1] for x in extra if x.startswith("--label=")), "")
+    for kv in extra:
+        if "=" in kv and not kv.startswith("--"):
+            k, _, v = kv.partition("=")
+            k6env[k] = v
+    r = subprocess.run(["scripts/pool", "loadgen", "up"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"the k6 machine didn't start: {r.stderr.strip()[-500:]}")
+    ip = r.stdout.strip().splitlines()[-1]
+    pool_ip = json.loads(subprocess.run(["terraform", "-chdir=infra", "output", "-json", "pool_nodes"], capture_output=True,
+                                        text=True).stdout or "{}").get(f"{c['pool']}-0", {}).get("public_ip", "")
+    ssh = ["ssh", "-i", ssh_key(), "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", f"core@{ip}"]
+    stop, samples, events = threading.Event(), [], []
+    kill = lambda: subprocess.run(ssh + ["docker kill k6"], capture_output=True)   # noqa: E731
+    started = datetime.datetime.now(datetime.timezone.utc)
+    p, summary, series = None, "", ""
+    try:
+        subprocess.run(ssh + ["mkdir -p /home/core/k6 && cat > /home/core/k6/test.js"], input=js.read_text(), text=True, check=True)
+        subprocess.run(ssh + ["cat > /home/core/k6/aggregate.py"], input=pathlib.Path("loadtest/aggregate.py").read_text(), text=True, check=True)
+        subprocess.run(ssh + ["rm -f /home/core/k6/metrics.csv.gz /home/core/k6/summary.json /home/core/k6/series.json"], check=True)
+        envs = " ".join(f"-e {k}={v!r}" for k, v in k6env.items() if k != "AUTH")
+        say(f"running {script} from {ip} ({', '.join(f'{k}={v}' for k, v in k6env.items() if k != 'AUTH')})")
+        threading.Thread(target=sample, args=(c, stop, samples, pool_ip), daemon=True).start()
+        threading.Thread(target=watch_sites, args=(stop, events, kill), daemon=True).start()
+        cmd = (f"read -r AUTH; docker run --rm -i --name k6 -u 0 --ulimit nofile=200000:200000 -v /home/core/k6:/k6 "
+               f"-e AUTH=\"$AUTH\" {envs} {K6_IMAGE} run --summary-export /k6/summary.json --out csv=/k6/metrics.csv.gz "
+               f"--quiet /k6/test.js")
+        p = subprocess.run(ssh + [cmd], input=k6env["AUTH"] + "\n", text=True, capture_output=True)
+        print(p.stdout[-4000:])
+        stop.set()
+        say("reducing the per-request data on the k6 machine")
+        subprocess.run(ssh + ["docker run --rm -v /home/core/k6:/k6 python:3.13-alpine python /k6/aggregate.py"],
+                       capture_output=True, text=True)
+        summary = subprocess.run(ssh + ["cat /home/core/k6/summary.json"], capture_output=True, text=True).stdout
+        series = subprocess.run(ssh + ["cat /home/core/k6/series.json"], capture_output=True, text=True).stdout
+    finally:
+        stop.set()
+        if not keep:   # every started hour is billed: the k6 machine goes as soon as the run ends
+            subprocess.run(["scripts/pool", "loadgen", "down"], capture_output=True, text=True)
+            say("k6 machine deleted")
+    out = report(c, script, k6env, started, p.stdout if p else "", summary, samples)
+    data = {"site": c["ns"], "script": script, "label": label, "started": started.isoformat(),
+            "settings": {k: v for k, v in k6env.items() if k != "AUTH"},
+            "pods": {x.split()[0]: x.split()[2] for x in kc("-n", c["lt"], "get", "deploy,sts", "--no-headers", check=False).stdout.splitlines() if x.strip()},
+            "summary": json.loads(summary) if summary.strip().startswith("{") else {},
+            "series": json.loads(series) if series.strip().startswith("{") else {}, "samples": samples, "watch": events}
+    jf = out.with_suffix(".json")
+    jf.write_text(json.dumps(data))
+    say(f"data: {jf}")
+
+
+def report(c, script, k6env, started, k6_out, summary_json, samples):
+    d = pathlib.Path("docs/loadtests")
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{started:%Y-%m-%d-%H%M}-{c['ns']}-{script}.md"
+    try:
+        m = json.loads(summary_json)["metrics"]
+    except Exception:  # noqa: BLE001
+        m = {}
+
+    def row(name, label):
+        v = m.get(name) or {}
+        if not v:
+            return ""
+        return f"| {label} | {v.get('avg', 0):.0f} | {v.get('med', 0):.0f} | {v.get('p(95)', 0):.0f} | {v.get('p(99)', 0):.0f} | {v.get('max', 0):.0f} |\n"
+    reqs, failed = (m.get("http_reqs") or {}), (m.get("http_req_failed") or {})
+    lines = [f"# Load test {started:%Y-%m-%d %H:%M} UTC: {c['ns']}, {script}\n\n",
+             f"Written by scripts/loadtest run. Target https://{c['host']} (production's image, generated data), from a "
+             f"temporary k6 machine in the server's region. Settings: "
+             + ", ".join(f"{k}={v}" for k, v in k6env.items() if k != "AUTH") + ".\n\n",
+             f"- Requests: {reqs.get('count', '?')} ({reqs.get('rate', 0):.1f} per second on average); failed: "
+             f"{100 * failed.get('value', failed.get('rate', 0)):.2f}%\n",
+             "\n| Latency (ms) | avg | median | p95 | p99 | max |\n|---|---|---|---|---|---|\n",
+             row("http_req_duration", "all requests"), row("http_req_duration{kind:page}", "pages"),
+             row("http_req_duration{kind:api}", "API reads"), row("http_req_duration{kind:write}", "writes"),
+             "\n## Nodes during the run (kubectl top nodes, every 10 s)\n\n```\n"]
+    for smp in samples:
+        lines.append(time.strftime("%H:%M:%S", time.gmtime(smp["t"])) + "  " + "  ".join(
+            f"{n} {v['cpu_m']}m {v['mem_mi']}Mi" for n, v in smp["nodes"].items()) + "\n")
+    lines += ["```\n\n## k6's own summary\n\n```\n", k6_out[-5000:], "\n```\n"]
+    f.write_text("".join(lines))
+    say(f"report: {f}")
+    return f
+
+
+def main():
+    a = sys.argv[1:]
+    if len(a) < 2:
+        print(__doc__)
+        sys.exit(2)
+    c, cmd, rest = cfg(a[0]), a[1], a[2:]
+    if cmd == "up":
+        cmd_up(c, int(rest[rest.index("--rows") + 1]) if "--rows" in rest else c["rows"])
+    elif cmd == "seed" and len(rest) == 1:
+        cmd_seed(c, int(rest[0]))
+    elif cmd == "run":
+        script = rest[0] if rest and "=" not in rest[0] and not rest[0].startswith("--") else "mixed"
+        cmd_run(c, script, [x for x in rest if x != script])
+    elif cmd == "scale" and rest:
+        cmd_scale(c, rest)
+    elif cmd == "status":
+        cmd_status(c)
+    elif cmd == "down":
+        cmd_down(c)
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

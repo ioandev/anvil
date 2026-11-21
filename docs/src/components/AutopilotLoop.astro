@@ -1,0 +1,34 @@
+---
+import Diagram from './Diagram.astro'
+const boxes = [
+  { x: 30, y: 20, w: 200, h: 86, title: 'watch (every 15 s)', lines: ['Alertmanager: firing', 'Prometheus: pending', 'minus silenced, Watchdog'] },
+  { x: 260, y: 20, w: 180, h: 86, title: '2 bad polls in a row', lines: ['strict status already', 'green? skip the run'] },
+  { x: 470, y: 20, w: 210, h: 86, kind: 'accent', title: 'run (≤ 15 min)', lines: ['secrets → tmpfs (OpenBao)', 'read-only repo clone', 'claude -p (headless)'] },
+  { x: 30, y: 160, w: 200, h: 76, title: 'twilio-alert hold', lines: ['calls held ≤ 20 min,', 'once per incident'] },
+  { x: 260, y: 160, w: 180, h: 76, title: 'live cluster (SSH)', lines: ['no deploys, no applies,', 'no git push'] },
+  { x: 470, y: 146, w: 210, h: 104, kind: 'danger', title: 'PreToolUse guard', lines: ['allows: restart, rollback,', 'job from cronjob, delete 1 pod,', 'prune images; refuses the rest'] },
+  { x: 30, y: 290, w: 200, h: 104, title: 'gave_up (latched)', lines: ['re-arms: 60 min cooldown,', '2 min healthy, or reset', 'max 4 runs per UTC day'] },
+  { x: 260, y: 290, w: 180, h: 104, title: 'records', lines: ['post-mortem (/changelog)', 'email summary', 'transcript: host +', 'age-encrypted off-site'] },
+  { x: 470, y: 290, w: 210, h: 104, kind: 'ok', title: 'report (≤ 5 min)', lines: ['2 clean polls + strict check', 'all pass: "fixed" → idle', 'otherwise: gave_up'] },
+]
+const edges = [
+  { d: 'M230,63 H258' },
+  { d: 'M440,63 H468' },
+  { d: 'M575,106 V144', kind: 'accent' },
+  { d: 'M470,198 H442', kind: 'accent' },
+  { d: 'M575,250 V288' },
+  { d: 'M470,342 H442' },
+  { d: 'M130,106 V158', kind: 'dash' },
+  { d: 'M575,394 V420 H130 V396' },
+  { d: 'M30,342 H14 V63 H28', kind: 'dash' },
+]
+const labels = [
+  { x: 138, y: 138, text: 'heartbeat: running' },
+  { x: 350, y: 414, text: 'not fixed', anchor: 'middle' },
+  { x: 22, y: 268, text: 're-arm' },
+]
+---
+<Diagram id="ap" width={690} height={432} boxes={boxes} edges={edges} labels={labels}
+  title="Autopilot loop"
+  desc="The watcher polls alerts every 15 seconds; after two bad polls it starts a run of Claude Code with secrets in tmpfs and a read-only clone; a guard hook only allows live-only actions; a report phase decides fixed or gave up, writes records, and a latch limits further runs."
+  caption="Autopilot loop: one run at a time, live-only actions, a strict definition of fixed, and a latch so a stuck incident can't burn runs." />

@@ -1,0 +1,104 @@
+---
+title: Infrastructure
+description: Terraform + Butane create one Scaleway instance running Flatcar and single-node k3s; scripts/node.sh operates it over SSH.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+Everything node-level is code in `infra/`: Terraform creates the cloud resources, Butane (rendered to Ignition by
+the `poseidon/ct` provider) configures the node on its **first boot**. There is no SSH provisioning step.
+
+## Cloud resources (Terraform, `infra/*.tf`)
+
+| Resource | What | Notes |
+|---|---|---|
+| `scaleway_instance_server.k3s` | the server | `ANVIL_INSTANCE_TYPE` (DEV1-L by default); root volume is the instance's local SSD (`l_ssd`, 80 GB) |
+| `scaleway_instance_ip.public` | flexible public IPv4 | survives a server replacement |
+| `scaleway_instance_security_group.k3s` | firewall | inbound default **drop**; 80/443 from each Cloudflare IPv4 range; SSH on `ssh_port` |
+| `scaleway_object_bucket` → `scaleway_object` → `scaleway_instance_snapshot` → `scaleway_instance_image` | the Flatcar image import chain | only needed to **create** a server; switched off afterwards |
+| `random_id`, `random_password` | bucket suffix, k3s join token | bucket names are unique per region across all accounts |
+
+Optional **agent nodes** (`agent_count`, default 0; small `agent_instance_type`, DEV1-S) join over a VPC private network
+with static IPAM addresses. They are tainted, so only pods that tolerate `anvil/light` run there; the platform and the
+apps stay on the main server. It's for cheap light work, not failover. See the variables in [Reference → Variables](/reference/variables/).
+
+### Flatcar on Scaleway: the import chain
+
+Flatcar publishes a Scaleway qcow2 per channel but there is **no marketplace image**, so you import it yourself:
+
+1. `make fetch` downloads `flatcar_production_scaleway_image.qcow2` (roughly 500–600 MB, 13.2 GB virtual size).
+2. Terraform uploads it to a bucket, imports it as an `l_ssd` **snapshot** (asynchronous, several minutes), wraps it
+   in an **instance image** (`root_volume_id` accepts the snapshot ID) and boots the server from it.
+3. Once the server is up, `make cleanup` writes `image_pipeline = false` to `infra/local.auto.tfvars` and deletes the
+   bucket, object, snapshot and image. The running server's root volume is an independent copy.
+
+<Aside type="caution">
+Before any server **rebuild or replacement**, set `image_pipeline` back to `true` (delete `infra/local.auto.tfvars`)
+and `make fetch`, or Terraform has no image to boot from. See [Rebuild the server](/operations/rebuild-server/).
+</Aside>
+
+## First boot (Butane, `infra/butane/flatcar.yaml.tpl`)
+
+| Piece | How |
+|---|---|
+| k3s | installed to `/opt/bin` (Flatcar's `/usr` is read-only) by a retrying oneshot, guarded by `ConditionPathExists=!/opt/bin/k3s`; `INSTALL_K3S_SKIP_SELINUX_RPM=true` + `INSTALL_K3S_SELINUX_WARN=true` (see [Lessons](/lessons/#infrastructure-and-machines)) |
+| k3s config | `/etc/rancher/k3s/config.yaml`: `fail-swap-on=false`, `image-gc-high-threshold=75`, `image-gc-low-threshold=65` |
+| Restart forever | drop-in `k3s.service.d/20-restart-forever.conf`: `Restart=always`, `StartLimitIntervalSec=0` |
+| Swap | 2 GiB `/var/swapfile` via `create-swapfile.service` + `var-swapfile.swap` (Flatcar's documented pattern), `vm.swappiness=10`; pods get no swap (`NoSwap`) |
+| OS updates | `update-engine` and `locksmithd` **masked**: the OS changes only when you rebuild |
+| SSH | `sshd.socket` drop-in on `ssh_port` (`ANVIL_SSH_PORT`, non-standard), key-only: only `~/.ssh/id_ed25519_anvil` (`make ssh-key`) |
+| Registry | `/etc/rancher/k3s/registries.yaml` with the Scaleway registry password (`TF_VAR_registry_password` = the Scaleway secret key) |
+| Traefik | a `HelmChartConfig` and the origin-pull `TLSOption`, dropped into `/var/lib/rancher/k3s/server/manifests/` (k3s applies anything there) |
+| Tailscale | Flatcar sysext (`tailscale_version`), optional auth key; `tailscale serve` publishes the internal UIs |
+
+Kubernetes manifests are embedded in Butane **base64-encoded** (`data:` URLs), never as inline YAML: YAML inside
+YAML is an indentation bug waiting to happen.
+
+<Aside type="caution" title="Ignition runs once">
+Changing Butane or `infra/manifests/` later does nothing to the running node. Apply the change on the live box by
+hand (k3s re-applies anything dropped into its manifests folder), then `terraform apply` (an in-place `user_data`
+update) so a rebuild gets it too.
+</Aside>
+
+Validate Butane locally without cloud credentials: render `data "ct_config"` with `strict = true` in a throwaway
+config with `local_file` outputs, then YAML-parse the embedded manifests.
+
+## Operating the node: `scripts/node.sh`
+
+`kubectl` lives on the node; your laptop talks to it over SSH. Nothing listens for the Kubernetes API publicly.
+
+| Command | Does |
+|---|---|
+| `node.sh ssh [cmd…]` | SSH as `core` |
+| `node.sh kubectl …` | `sudo kubectl` on the node (stdin passes through) |
+| `node.sh deploy <ns>…` | ConfigMaps (`sites.yaml` `configmaps:`) + generated Secrets + `{platform,apps}/<ns>/app.yaml`, rendered with `${ANVIL_*}` from `anvil.env`; then restarts **only** workloads whose config changed |
+| `node.sh deploy-all` | every namespace in `sites.yaml`, platform first (`make apps` = `make secrets` + this) |
+| `node.sh diff <ns>…` | `kubectl diff` of the rendered manifest against the cluster (changes nothing) |
+| `node.sh restore-db <ns>` | replace one project's database from `.data/<ns>/db.sql.gz` |
+| `node.sh atlas-users` | (re)apply every project's `_rw`/`_ro` users, the backup and health users, and the grants (idempotent) |
+| `node.sh curl <host> [path]` | request a site through Traefik **with** the origin-pull client cert (plain curl gets `000`) |
+| `node.sh load-pvc <ns> <pvc> <uid> <tgz>` | unpack a tarball into a PVC (throwaway pod) |
+| `node.sh run-job <ns> <job.yaml>` | (re)run a one-off Job, wait, show its log |
+| `node.sh disk` | root disk size and usage |
+
+### Config changes restart exactly what changed
+
+`node.sh deploy` fingerprints the Secrets and ConfigMaps each Deployment/StatefulSet uses (env, `envFrom`,
+volumes) and stores it in the annotation `anvil/config-hash`. When the fingerprint changes it
+restarts only that workload, with its own strategy, and prints `config changed: restarted <ns>/<name>`. A redeploy
+with nothing changed restarts nothing. So a new secret, new Prometheus rules or a new dashboard take effect by
+deploying; a manual `rollout restart` after a deploy is a bug.
+
+<Aside type="note">
+`node.sh deploy` applies each manifest twice (a silent pass to create the namespace, then the visible one), so the
+visible output often says `unchanged` even when things changed. Check with `kubectl get … -o jsonpath`.
+</Aside>
+
+## Reproducibility rules
+
+- Everything must be reproducible on a fresh server: node setup in Butane, workloads with `make apps`, databases
+  with `node.sh restore-db`, files with `node.sh load-pvc` from `.data/<ns>/` (gitignored: too big for git).
+- Non-secret config lives in the repo; secrets in `anvil.env` and `apps/<ns>/prod.env`, with encrypted twins.
+- Site DNS records are **not** owned by Terraform: they're flipped per host with `scripts/cutover.py` (so a
+  Terraform mistake can't take every site's DNS with it).
+- Image garbage collection: kubelet deletes unused images once the disk is 75 % full, down to 65 %.

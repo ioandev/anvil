@@ -1,0 +1,47 @@
+---
+title: 'Decision: one shared MariaDB'
+description: Why one MariaDB instance with a database and two least-privilege users per project, instead of a database container per project.
+---
+
+**Status:** accepted (2026-10-18, when eleven per-project instances were merged).
+
+## Context
+
+The previous server ran one MariaDB container per project: eleven buffer pools, eleven sets of root passwords,
+eleven things to back up and upgrade, and several apps connecting as root.
+
+## Decision
+
+One MariaDB StatefulSet (`atlas`) for every project. Each project gets **its own database** and **exactly two
+users** limited to it: `<ns>_rw` (data + the DDL its migrations need) and `<ns>_ro` (SELECT, SHOW VIEW). root works
+only from inside the pod. Users, passwords and grants are code (`node.sh atlas-users`, idempotent); restores are per
+project (`node.sh restore-db <ns>`). Every password was regenerated at the merge.
+
+## Consequences
+
+- + One process and one buffer pool: RAM goes to apps instead.
+- + One backup job dumps every database (as a read-only user); one health check (`/database`).
+- + Least privilege by default: an app's credentials can't read another project's data.
+- − **A shared failure domain**: if atlas is down, every database-backed app is down. The autopilot is not allowed
+  to restart or delete it (it reports instead); it's watched by `/database` and `StatefulSetUnavailable`.
+- − Server-wide settings (full-text token size, stopwords) apply to everyone.
+- − Version choice is shared (the original server runs the latest MariaDB, chosen over LTS).
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| One container per project | the status quo it replaced: RAM, sprawl, root everywhere |
+| SQLite everywhere | fine for single-process apps (and used, with online `.backup`), not for the rest |
+
+## How it was decided
+
+- On night one the owner's rule was the opposite: "the databases have to sit separate like they are now". The next
+  night, with 0.9 GB of RAM left and eleven instances holding 38 MB of data in ~2 GB of RAM, he asked to "merge
+  everything … two users for each project … only the database they are using". The decision was reversed with the
+  numbers in hand.
+- Claude wanted the LTS line; the owner chose the latest MariaDB.
+- The move ran one app at a time (~2 minutes each). Isolation was tested (`<a>_rw` gets "SELECT command denied" on
+  another project's database). Deleting the old instances was blocked by the permission check and done by the owner
+  from exact commands in `HUMAN.md`.
+- Every password was regenerated at the merge: the old ones had been reused and some were in an old repo's history.

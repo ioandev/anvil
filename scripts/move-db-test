@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# End-to-end test of scripts/move-db on the server with throwaway pieces only (namespace zz-move, deleted at the end):
+# nothing touches atlas or any real project.
+#
+#   scripts/move-db-test [rows]     rows of filler data in the fake project's database (default 300000, ~40 MB)
+#   TEST_POOL=demo scripts/move-db-test 15000000   the rehearsal: ~2 GB, the copy on the pool node over the real path
+#
+# Pieces: zz-src (a MariaDB set up like atlas: binary log of one database only), zz-writer (inserts a numbered row
+# every 100 ms, recording every insert the database confirmed on its own volume), zz-api (a stand-in API behind a
+# Service, polled by the writer, to see the 503 switch). Steps: prepare, seed, follow, cutover, back-follow, back,
+# remove. Then: every confirmed write must be in the final database, and the API's closed time is printed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ROWS=${1:-300000}
+NS=zz-move
+k() { scripts/node.sh kubectl "$@" </dev/null; }
+ki() { scripts/node.sh kubectl "$@"; }
+pw() { python3 -c 'import secrets;print(secrets.token_hex(16))'; }
+ROOT_PW=$(pw); REPL_PW=$(pw); RW_PW=$(pw); RO_PW=$(pw)
+cleanup() { echo "== cleanup"; k delete namespace "$NS" --wait=false >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+echo "== setting up $NS"
+ki apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: Namespace
+metadata: { name: $NS }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: zz-src-root, namespace: $NS }
+stringData: { MARIADB_ROOT_PASSWORD: "$ROOT_PW" }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: zz-db, namespace: $NS }
+stringData: { DB_HOST: zz-src.$NS, DB_USER: "zz_move_rw", DB_PASSWORD: "$RW_PW", DB_NAME: zzapp }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zz-src, namespace: $NS }
+spec: { selector: { app: zz-src }, ports: [{ port: 3306 }] }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: zz-src, namespace: $NS }
+spec:
+  serviceName: zz-src
+  selector: { matchLabels: { app: zz-src } }
+  template:
+    metadata: { labels: { app: zz-src } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsUser: 5450, runAsGroup: 5450, fsGroup: 5450 }
+      containers:
+        - name: mariadb
+          image: mariadb:13.0.2
+          args: ["--innodb-buffer-pool-size=64M", "--performance-schema=OFF", "--server-id=1", "--log-bin=atlas-bin", "--log-basename=atlas", "--binlog-format=ROW", "--gtid-strict-mode=ON", "--binlog-do-db=zzapp"]
+          env:
+            - { name: MARIADB_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: zz-src-root, key: MARIADB_ROOT_PASSWORD } } }
+            - { name: MARIADB_ROOT_HOST, value: localhost }
+          readinessProbe: { exec: { command: ["healthcheck.sh", "--connect", "--innodb_initialized"] }, periodSeconds: 2 }
+          resources: { limits: { memory: 320Mi } }
+          volumeMounts: [{ name: d, mountPath: /var/lib/mysql }]
+      volumes: [{ name: d, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: zz-api, namespace: $NS }
+spec: { selector: { app: zz-api }, ports: [{ port: 8080, targetPort: 8080 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zz-api, namespace: $NS }
+spec:
+  selector: { matchLabels: { app: zz-api } }
+  template:
+    metadata: { labels: { app: zz-api } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsUser: 5466, runAsGroup: 5466 }
+      containers:
+        - name: nginx
+          image: nginxinc/nginx-unprivileged:1.30-alpine
+          resources: { limits: { memory: 32Mi } }
+          readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 2 }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: zz-writer-log, namespace: $NS }
+spec: { accessModes: [ReadWriteOnce], storageClassName: local-path, resources: { requests: { storage: 64Mi } } }
+EOF
+k -n $NS rollout status statefulset/zz-src --timeout=300s >/dev/null
+until [ "$(k -n $NS get pod zz-src-0 -o jsonpath='{.status.containerStatuses[0].ready}')" = true ]; do sleep 2; done
+echo "== filling zzapp with $ROWS rows, users like atlas's"
+ki -n $NS exec -i zz-src-0 -c mariadb -- sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"' <<EOF
+CREATE DATABASE zzapp; USE zzapp;
+CREATE TABLE filler (id INT AUTO_INCREMENT PRIMARY KEY, payload VARCHAR(100), created DATETIME(6) DEFAULT NOW(6));
+CREATE TABLE writes (seq INT PRIMARY KEY, pod VARCHAR(80), at DATETIME(6) DEFAULT NOW(6));
+INSERT INTO filler (payload) SELECT REPEAT(MD5(seq), 3) FROM seq_1_to_$ROWS;
+CREATE DATABASE zzother; CREATE TABLE zzother.secret (v VARCHAR(50)); INSERT INTO zzother.secret VALUES ('OTHER_PROJECT_DATA');
+CREATE USER 'zz_move_rw'@'%' IDENTIFIED BY '$RW_PW';
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX ON zzapp.* TO 'zz_move_rw'@'%';
+CREATE USER 'zz_move_repl'@'%' IDENTIFIED BY '$REPL_PW';
+GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.* TO 'zz_move_repl'@'%';
+GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES, SHOW CREATE ROUTINE ON zzapp.* TO 'zz_move_repl'@'%';
+EOF
+
+echo "== starting the writer"
+ki apply -f - >/dev/null <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: zz-writer, namespace: zz-move }
+spec:
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: zz-writer } }
+  template:
+    metadata: { labels: { app: zz-writer } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsUser: 5467, runAsGroup: 5467, fsGroup: 5467 }
+      containers:
+        - name: writer
+          image: mariadb:13.0.2
+          envFrom: [{ secretRef: { name: zz-db } }]
+          command: ["bash", "-c"]
+          args:
+            - |
+              touch /log/acks /log/api; seq=$(cat /log/seq 2>/dev/null || echo 0)
+              while true; do
+                seq=$((seq+1)); echo $seq > /log/seq
+                if MYSQL_PWD="$DB_PASSWORD" mariadb -h "$DB_HOST" -u "$DB_USER" --connect-timeout=2 "$DB_NAME" -e "INSERT INTO writes (seq, pod) VALUES ($seq, '$HOSTNAME')" 2>/dev/null; then
+                  echo "$seq" >> /log/acks
+                fi
+                code=$( (exec 3<>/dev/tcp/zz-api/8080 && printf 'GET / HTTP/1.0\r\n\r\n' >&3 && head -1 <&3 | cut -d' ' -f2) 2>/dev/null || echo 000)
+                echo "$(date +%s.%N | cut -c1-14) $code" >> /log/api
+                sleep 0.1
+              done
+          resources: { limits: { memory: 64Mi } }
+          volumeMounts: [{ name: log, mountPath: /log }]
+      volumes: [{ name: log, persistentVolumeClaim: { claimName: zz-writer-log } }]
+EOF
+k -n $NS rollout status deploy/zz-writer --timeout=180s >/dev/null; k -n $NS rollout status deploy/zz-api --timeout=120s >/dev/null
+sleep 5
+
+export MOVE_TARGET_NS=$NS MOVE_NAME=zz-move-mariadb MOVE_DB=zzapp MOVE_POOL=${TEST_POOL:-} MOVE_UID=5465 MOVE_MAINT_UID=5466 \
+  MOVE_SOURCE_POD=$NS/zz-src-0 MOVE_SOURCE_HOST=zz-src.$NS MOVE_APP_SECRET=zz-db MOVE_ALIAS=zz-db-alias MOVE_WORKLOADS=deploy/zz-writer \
+  MOVE_MAINT_SERVICE=zz-api MOVE_NO_SITES=1 MOVE_NO_BACKUP=1 MOVE_STORAGE=1Gi MOVE_BUFFER_POOL=64M MOVE_MEMORY=320Mi \
+  MOVE_ROOT_PW=$ROOT_PW MOVE_REPL_PW=$REPL_PW MOVE_RW_PW=$RW_PW MOVE_RO_PW=$RO_PW
+M() { scripts/move-db zz-move "$@"; }
+M use-alias; M prepare; M seed; M follow; sleep 10; M status
+echo "== is the other project's data on the target? (must be no)"
+ki -n $NS exec -i zz-move-mariadb-0 -c mariadb -- sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -e "SHOW DATABASES LIKE \"zzother\""' </dev/null | grep -q zzother && { echo "FAIL: zzother reached the target"; exit 1; } || echo "no: only zzapp travelled"
+M cutover; sleep 15; M back-follow; sleep 10; M back; sleep 5
+echo "== verifying"
+acks=$(ki -n $NS exec deploy/zz-writer -- sh -c 'sort -n /log/acks | uniq' </dev/null)
+inDb=$(ki -n $NS exec -i zz-src-0 -c mariadb -- sh -c 'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N zzapp -e "SELECT seq FROM writes ORDER BY seq"' </dev/null)
+missing=$(comm -23 <(echo "$acks" | sort) <(echo "$inDb" | sort) | wc -l)
+echo "confirmed writes: $(echo "$acks" | grep -c .), in the final database: $(echo "$inDb" | grep -c .), confirmed but missing: $missing"
+ki -n $NS exec deploy/zz-writer -- sh -c 'awk "{c[\$2]++} END {for (k in c) print \"api answered \" k \": \" c[k]}" /log/api' </dev/null
+M status | head -3
+M remove
+[ "$missing" = 0 ] && echo "PASS: no confirmed write lost" || { echo "FAIL: $missing confirmed writes missing"; exit 1; }

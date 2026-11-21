@@ -1,0 +1,67 @@
+---
+title: Endpoints
+description: Every URL the platform exposes - public status endpoints, tailnet-only UIs, in-cluster services and the second machine.
+---
+
+Hostnames are placeholders: `status.example.com` is `status.${ANVIL_DOMAIN}`, `<node>.<tailnet>.ts.net` is the server on
+the tailnet (`ANVIL_TAILNET_HOST`), `<mac>.<tailnet>.ts.net` the home machine (`ANVIL_HOME_TAILNET_HOST`).
+
+## Public (through Cloudflare): the status host
+
+Every GET needs `?code=<STATUS_CODE>`; every POST the header `X-Token: <WEBHOOK_TOKEN>` and
+`Content-Type: application/json`. Anything else gets a bare 500. Rate limit: 60/min per visitor IP, burst 100.
+
+| Path | Method | Answer | Details |
+|---|---|---|---|
+| `/up` | GET, HEAD (**no code**) | 200 / 500, empty | the last `/overall` verdict if under 5 min old: for UptimeRobot-style monitors |
+| `/memory` | GET (**no code**) | 200 / 500, one line | 200 while the node has at least **500 MB** of memory available; the body gives the node's real figures from `/proc/meminfo` (available of total, in use, swap), counting k3s, containerd and the cache that Dozzle's per-container view leaves out. Not part of `/overall`; aim for about 1 GB available |
+| `/overall` | GET | 200 / 500 | all of the next five |
+| `/space` | GET | 200 / 500 | ≥ 10 GB free on the node's root disk |
+| `/database` | GET, POST | 200 / 500 | live MariaDB greeting + the `health` user's last real login < 45 min |
+| `/backups` | GET, POST | 200 / 500 | every `component=backup` CronJob succeeded in 26 h; report < 45 min old |
+| `/cluster` | GET | 200 / 500 | probes up, workloads ready, nothing stuck; `&strict=1` skips the work-in-progress exceptions |
+| `/error_arduino` | GET, POST | 200 `ok` / 500 | the error latch; cleared by hand |
+| `/os` | GET | 200 / 500 | 500 when a newer Flatcar release of the node's channel is out (OS updates are manual) or it can't check; not part of `/overall`, so it never phones |
+| `/watchdog` | GET | 200 JSON | `{"ok", "reason", "mutedUntil"}` for the off-box watchdog |
+| `/am_heartbeat` | POST | | Alertmanager's `Watchdog` alert |
+| `/am_latch?token=<WEBHOOK_TOKEN>` | POST | `ok` | Alertmanager's `severity="notify"` alerts → the error latch, one line per alert and site a day (the token is in the query because Alertmanager's webhook can't send a custom header) |
+| `/autopilot` | GET | text | the autopilot's status page |
+| `/autopilot_state` | POST | JSON | the autopilot's heartbeat; returns queued commands |
+| `/autopilot_reset`, `/autopilot_pause?minutes=N`, `/autopilot_resume` | GET | one line | queue an owner command |
+| `/autopilot_metrics` | GET | Prometheus text | scraped by Prometheus |
+| `/autopilot_run` | POST | | upload a scrubbed transcript (in parts) |
+| `/autopilot_runs` | GET | text / redirect | the runs; `&id=<run>` opens one |
+| `/postmortem` | POST | | append a post-mortem entry |
+| `/changelog?days=N` | GET | text | post-mortems, newest first (`days=0`: all; `&format=files`) |
+
+See [Status webhooks](/components/status-webhooks/).
+
+## Tailnet only
+
+| URL | What | Behind it |
+|---|---|---|
+| `https://<node>.<tailnet>.ts.net` | Dozzle (logs) | `tailscale serve` → `127.0.0.1:18080` (host network) |
+| `https://<node>.<tailnet>.ts.net:8443` | Alertmanager (silences) | → fixed ClusterIP, port 9093 |
+| `https://<node>.<tailnet>.ts.net:9443` | Prometheus | → fixed ClusterIP, port 9090 |
+| `https://<node>.<tailnet>.ts.net:3443` | Grafana | → fixed ClusterIP, port 3000 |
+| `https://<node>.<tailnet>.ts.net:8446` | the [autopilot run viewer](/components/autopilot/#the-run-viewer) | → fixed ClusterIP, port 8080 |
+| `https://<mac>.<tailnet>.ts.net:<ANVIL_HOME_BAO_PORT>` (8200 by default) | the vault (OpenBao) | the home machine's `tailscale serve` |
+
+The fixed ClusterIPs are `10.43.200.90` (Prometheus), `10.43.200.93` (Alertmanager), `10.43.200.94` (Grafana) and
+`10.43.200.97` (the autopilot viewer), set both
+in the Services and in Butane's `tailscale serve` commands; change both together. The tailnet is the login: Grafana is
+anonymous Editor there (plus an admin login), Dozzle has no login of its own.
+
+## In-cluster only
+
+| Address | What |
+|---|---|
+| `atlas-mariadb.atlas:3306` | the shared MariaDB |
+| `http://alerting-twilio.alerting:3000` | twilio-alert: `/alert`, `/autopilot`, `/test-call`, `/pager` (all `?password=<SERVICE_PASSWORD>`) |
+| `alerting-prometheus`, `alerting-alertmanager`, `alerting-blackbox`, `alerting-kube-state-metrics` | the monitoring stack (kube-state-metrics: `/livez` on 8080, `/readyz` on 8081) |
+| `alerting-node-exporter` pods `:9101`, `alerting-mysqld-exporter:9104`, the Traefik pods in kube-system `:9100` (the server's and a pool's direct-mode one) | the node, replication and Traefik figures for the [capacity alerts](/components/monitoring/#capacity-alerts-that-come-before-failures) |
+
+## SSH
+
+`ssh -i ~/.ssh/id_ed25519_anvil -p $ANVIL_SSH_PORT core@$ANVIL_SERVER_IP` (the key from `make ssh-key`), or `scripts/node.sh ssh`. Key-only, open to
+the world on purpose (so access survives losing Tailscale).

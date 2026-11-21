@@ -1,0 +1,101 @@
+# Dozzle: live log viewer for every pod in the cluster (Kubernetes mode).
+# TAILSCALE ONLY: https://${ANVIL_TAILNET_HOST} (tailscale serve, set up by
+# Butane's tailscale-bootstrap unit). Dozzle runs on the host network but
+# listens on 127.0.0.1:18080 only, so the public internet, the pod network and
+# the private NIC can't reach it. There's no Service, no Ingress and no DNS
+# record on purpose.
+# Login: none of its own: the tailnet is the login (as for Grafana and Prometheus). Read-only RBAC below.
+# Strictly read-only: the ClusterRole grants get/list/watch only, with no
+# pods/exec and no delete, so even a logged-in user can't open a shell or
+# restart anything. Kubernetes enforces that, not Dozzle.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dozzle
+  labels: { app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dozzle
+  labels: { app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: dozzle
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dozzle-log-reader
+  labels: { app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "daemonsets", "statefulsets"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dozzle-log-reader
+  labels: { app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+subjects:
+  - { kind: ServiceAccount, name: dozzle, namespace: dozzle }
+roleRef:
+  kind: ClusterRole
+  name: dozzle-log-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# User settings Dozzle saves (filters, preferences).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dozzle-data
+  labels: { app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: dozzle
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dozzle
+  labels: { app.kubernetes.io/name: dozzle, app.kubernetes.io/part-of: dozzle, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: dozzle
+spec:
+  selector: { matchLabels: { app: dozzle } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: dozzle, app.kubernetes.io/name: dozzle, app.kubernetes.io/part-of: dozzle, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      serviceAccountName: dozzle
+      # Host network so it can bind the node's loopback for `tailscale serve`.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      securityContext: { runAsUser: 5410, runAsGroup: 5410, fsGroup: 5410 }
+      containers:
+        - name: dozzle
+          image: amir20/dozzle:v11.3.2
+          env:
+            - { name: DOZZLE_MODE, value: k8s }
+            - { name: DOZZLE_AUTH_PROVIDER, value: none }
+            - { name: DOZZLE_NO_ANALYTICS, value: "true" }
+            # Loopback only; Tailscale is the only way in.
+            - { name: DOZZLE_ADDR, value: "127.0.0.1:18080" }
+          resources: { limits: { memory: 256Mi } }
+          readinessProbe: { tcpSocket: { host: 127.0.0.1, port: 18080 }, periodSeconds: 10 }
+          # Restarts it if it stops answering (hung, not just crashed). Generous, so slow starts aren't killed.
+          livenessProbe: { tcpSocket: { host: 127.0.0.1, port: 18080 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: dozzle-data } }

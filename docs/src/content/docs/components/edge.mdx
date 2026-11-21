@@ -1,0 +1,208 @@
+---
+title: Edge (Cloudflare)
+description: Cloudflare Free in front of every site - Origin CA certificates, Authenticated Origin Pulls with your own CA, a firewall open only to Cloudflare, edge caching for anonymous visitors, www redirects, DNS cutovers and the stale-DNS traps.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Every public site sits behind Cloudflare's **Free** plan with proxied (orange-cloud) records. The origin trusts
+nothing but Cloudflare, and Cloudflare is only trusted if it presents **your** client certificate.
+
+## Two locks on the origin
+
+| Lock | Where | Stops |
+|---|---|---|
+| Firewall: 80/443 only from Cloudflare's IPv4 ranges | Scaleway security group (`cloudflare_ipv4_ranges` in `infra/variables.tf`, matches cloudflare.com/ips-v4) | scanners and anyone who learns the origin IP |
+| Client certificate signed by **your** CA | Traefik's default `TLSOption` (`RequireAndVerifyClientCert`, `infra/manifests/origin-pull.yaml.tpl`) | other Cloudflare customers: their zone could point at your IP and pass the firewall |
+
+Cloudflare's **shared** origin-pull certificate would not do: every Cloudflare customer can present it. anvil
+generates its own CA, client certificate and key once (kept outside git in the restore bundle, encrypted twins in
+git), and `scripts/cloudflare-zones.py` uploads the client certificate to every zone (per-zone Authenticated Origin
+Pulls). Check from the node with `scripts/node.sh curl <host> [path]`, which presents that certificate; a plain
+`curl` gets `000`.
+
+<Aside type="caution">
+Refresh `cloudflare_ipv4_ranges` from https://www.cloudflare.com/ips-v4 if Cloudflare ever changes them. A planned
+Comparing them now and then is a manual check today.
+</Aside>
+
+## Certificates: Cloudflare Origin CA, no ACME
+
+`scripts/origin-certs.py` issues one **Origin CA** certificate per zone (`zone` + `*.zone`, 15 years) from your
+laptop. Keys and certificates live in `.data/origin-ca/` (encrypted twins in git) and reach Traefik as TLS
+Secrets in its **default TLSStore** (`platform/origin-ca`), which picks one by SNI. Browsers never see them; they
+only need to be trusted by Cloudflare, with the zone's SSL mode on **Full (strict)**.
+
+Consequences:
+
+- Ingresses carry **no `certresolver`** annotation. Let's Encrypt only remains in the template's non-Cloudflare
+  fallback.
+- **No Cloudflare API token on the server.** ACME DNS-01 would need one in a Kubernetes Secret; Origin CA doesn't.
+- A new domain is: add it under `zones:` in `sites.yaml`, `python3 -I scripts/sites.py render` (rewrites the TLSStore
+  list), `origin-certs.py`, deploy `origin-ca`.
+
+## The Cloudflare API token: local and least-privilege
+
+The token lives in `anvil.env` (`CLOUDFLARE_API_TOKEN`, encrypted twin in git) on your laptop. It is never sent to the server.
+
+| Permission | Why |
+|---|---|
+| Zone (edit), Zone Read | create zones, read their state |
+| DNS (edit) | records and cutovers |
+| Zone Settings (edit) | SSL mode, Authenticated Origin Pulls |
+| SSL and Certificates (edit) | Origin CA certificates, per-zone client cert upload |
+| Cache Settings (edit) | the [edge cache](#edge-caching) rules and Tiered Cache |
+| Cache Purge | `scripts/cloudflare-purge` after every deploy |
+
+No token management, billing, Workers or R2. The edge-purger has a second, purge-only token of its own (see [Edge caching](#edge-caching)). To rotate: create a new token with the same scope, put it in `anvil.env`,
+run the scripts once to prove it, delete the old one, `make secrets-encrypt`.
+
+## `www` → apex
+
+Every site answers `www.<domain>` with a **301** to `https://<domain>/<same path and query>`. It's **one** Traefik
+IngressRoute for all sites (`platform/www/app.yaml`, no pod: Traefik's `noop@internal` service plus a
+`redirect-to-apex` middleware), generated from each site's `www:` list in `sites.yaml`, plus a proxied `www` A
+record per domain. TLS needs nothing extra: the Origin CA cert covers `*.<domain>`, Cloudflare's covers `www`.
+
+## Moving a domain onto the platform
+
+<Steps>
+
+1. **Create the zone** with `scripts/cloudflare-zones.py` (idempotent; it mirrors the existing records listed under
+   `zones: <zone>: records:` in `sites.yaml` and uploads the origin-pull cert).
+2. **Switch the nameservers** at the registrar to the pair **this zone** reports. Cloudflare assigns nameservers per
+   zone, so two of your zones can get different pairs. Never move nameservers before the zone exists. (anvil plans
+   both: Namecheap API automation when you give it a token, otherwise a step written into `HUMAN.md`.)
+3. **Wait for the edge certificate**, not just activation: `GET /zones/<id>/ssl/certificate_packs` must show a pack
+   `active`. It can lag activation by minutes, and until then every HTTPS handshake through Cloudflare fails (PWAs
+   show "offline").
+4. **Cut over** each host: `scripts/cutover.py <server-ip> <host>…` (rollback: `--rollback <old-ip> <host>…`).
+5. **Verify through a Cloudflare IP** (`curl --resolve <host>:443:<cloudflare-ip> https://<host>/`), not your own
+   resolver, which may still point at the old server.
+
+</Steps>
+
+### The "ghost domain" trap
+
+After a nameserver switch, the old registrar's DNS servers keep answering **authoritatively with the old
+records**, and Google Public DNS can stick to them for up to two days. Check
+`https://dns.google/resolve?name=<host>&type=A`. If it's stale, flush it at
+https://developers.google.com/speed/public-dns/cache (type A per hostname; that also refreshes NS). Stop the old
+server's copy of a site only after that.
+
+## Edge caching
+
+Every public site makes an **edge-cache decision** ([rule 19](/reference/app-rules/)): `edge_cache:` on its namespace
+in [`sites.yaml`](/reference/sites-yaml/#edge_cache), either a cache time for anonymous visitors or `false` with the
+reason (private, an API, live data). A cache time is the default answer. Pages that are the same for everyone are then
+served by Cloudflare: a crowd that comes, looks and leaves costs the server nothing, and the server renders each cached
+page about once per cache time instead of once per visitor. It is all on Cloudflare's free plan.
+
+Why it matters: in a ceiling test of a production deployment, rendering pages was the most expensive thing the sites
+did, and a 1-second cache for anonymous pages tripled what the same server could take ([the results](/operations/load-test/#reference-results)).
+`python3 -I scripts/sites.py check` warns about a public app with no decision.
+
+### What is cached, and for whom
+
+`scripts/cloudflare-cache-rules.py` generates one Cloudflare Cache Rule per site from `sites.yaml`. A request is
+answered from the cache only when **all** of these hold:
+
+- it is a `GET` or `HEAD`;
+- it carries **no `Cookie` header at all**: anyone logged in, or holding any session, goes to the site itself;
+- it carries no `Authorization` header (basic auth, tokens);
+- it isn't a Next.js in-app navigation request (the `RSC` or `Next-Router-State-Tree` header, or `_rsc=` in the
+  query: a different format at the same address);
+- its path doesn't contain `/api`, unless it starts with one of the site's `allow_api` prefixes (public, read-only API
+  paths), and doesn't start with any of its `exclude` prefixes (live streams, websockets, admin pages, health checks).
+
+Cloudflare itself never stores a response that sets a cookie. So the rule is the same for every site and safe
+without knowing each app's cookies: a first-time visitor has none, a logged-in one always has a session cookie. The
+edge cache time overrides the app's own `no-store`; browsers still follow the app's headers.
+
+<Aside type="caution">
+Never cache a page that is personal **without** a cookie: IP-based content, per-visit tokens or CSRF tokens in the
+HTML. Exclude those paths, or set `edge_cache: false`.
+</Aside>
+
+**Build files and resized images** (`/_next/static/`, `/_next/image`, `/_astro/`) get a second rule: cached for a day
+(`ASSET_TTL`, 86400 s) for **everyone**, cookies or not. Build files have hashed names and a resized image is keyed by
+source, width and quality, so they are the same for every visitor. This rule comes last in each zone, so its time wins
+over the page rule for these paths. They can't go stale: every deploy and every content purge clears the whole zone.
+
+**Tiered Cache** (free) is switched on for every zone with a cached site: Cloudflare's edge locations fetch from one
+upper tier near the origin instead of each asking the server.
+
+### The parts
+
+| Part | What it does |
+|---|---|
+| `scripts/cloudflare-cache-rules.py` (`--dry-run` prints the rules) | generates the Cache Rules from `sites.yaml`, replaces each zone's cache ruleset (idempotent), turns on Tiered Cache. Runs on your laptop with `CLOUDFLARE_API_TOKEN` |
+| **edge-warmer** (`platform/edge-warmer`, UID 5540) | requests each site's `warm:` pages (default `/`) as an anonymous visitor once 80% of their cache time has passed, so the first visitor after a quiet spell is still answered by Cloudflare. One batched `curl` per pass, a few MB of memory, one log line per 5 minutes. Its URL list is generated by `sites.py render` |
+| **purge after every deploy** | `scripts/node.sh deploy <ns>` purges the site's zone once the new pods serve (`scripts/cloudflare-purge`, from your laptop; `NO_EDGE_PURGE=1` skips it). The free plan has no purge by prefix, so it purges everything; the warmer refills the main pages within seconds |
+| **edge-purger** (same namespace, UID 5541) | for content that changes without a deploy (a post written in an admin page): every 30 s it runs the site's `purge_on_change` query as the site's read-only user and purges the zone when the answer changes. It needs its **own** token, `CLOUDFLARE_PURGE_TOKEN` (Zone Read + Cache Purge on the zone only), because the main token never goes to the server. Without it, it waits and deploys still purge |
+| **probes bypass the cache** | the blackbox probes send `Cookie: monitoring=1`, so monitoring always measures the site itself, never Cloudflare's copy of a site that is down |
+| `scripts/edge-cache-monitor run [--hours 12]` / `report <csv>` | samples every cached site's warm pages as Chrome on Android with no cookies, every 20–40 minutes (wider than the cache times, so the monitor doesn't warm the cache itself), and records HIT/MISS, the cached copy's age, the Cloudflare location and DNS/connect/TLS/first-byte times. Run it from a machine that reaches the same Cloudflare location as the visitors you care about |
+
+The demo is the example: Cloudflare serves its guestbook for 30 s, `/admin` and the health endpoints are never
+cached, the form posts to `/api` (never cached), and the edge-purger purges the zone as soon as the worker approves
+a new entry. The status host has `edge_cache: false`.
+
+### Add a site
+
+<Steps>
+
+1. Decide whether its anonymous pages are the same for everyone. If not, `edge_cache: false` with the reason in a
+   comment, and stop here.
+2. In `sites.yaml`, on the namespace: `edge_cache: { ttl: <seconds> }`, plus `exclude` for live paths and admin pages,
+   `allow_api` for public read-only API paths, `ttl_by_host` / `ttl_paths` for hosts or pages that need their own time,
+   `warm` for the most visited pages, `purge_on_change` if content changes without a deploy. Seconds for live data,
+   minutes for content sites, an hour for docs.
+3. Apply it:
+
+   ```sh
+   python3 -I scripts/sites.py render && python3 -I scripts/sites.py check
+   python3 scripts/cloudflare-cache-rules.py
+   scripts/node.sh deploy edge-warmer
+   ```
+
+4. Check, through Cloudflare:
+
+   ```sh
+   curl -sI "https://<host>/?x=$RANDOM" | grep -i cf-cache-status          # MISS, then the same URL again: HIT
+   curl -sI -H 'Cookie: x=1' https://<host>/ | grep -i cf-cache-status    # DYNAMIC (the site itself)
+   ```
+
+   and every excluded path: `DYNAMIC`.
+
+</Steps>
+
+### Worked example: a slow page on a phone
+
+On the original server, the owner said a blog took over 2 seconds to load on a phone. Checked as Chrome on Android with
+no cookies, through the Cloudflare location the phone used: the pages were cached (`HIT` in about 0.28 s), nothing on
+the blog set a cookie, and its JavaScript and CSS were `HIT`. **The images were the problem.** Next.js resizes each
+picture on the server for the visitor's screen width (`/_next/image?url=/header.jpg&w=1080&q=75`, one copy per width)
+and labels the result `max-age=60`. The page rule kept each width for a few minutes, for anonymous visitors only, and
+nothing warmed the phone widths, so a phone often got a `MISS` and waited for the server to resize the header again:
+**about 1.35 s** for that one image.
+
+The fix was the one-day rule for build files and resized images above. Eight hours of `edge-cache-monitor` sampling
+afterwards (17 rounds, 204 requests): every sample of the blog's pages and images was a `HIT`, none took over 1 s, and
+none failed. The two sites with very short cache times (10 s and 60 s, live data) missed when nobody had visited
+within their cache time, as expected, and even their misses answered in under 0.4 s.
+
+### Limits
+
+- Logged-in visitors always reach the site; a site with many logged-in visitors needs its shared parts made shareable
+  in the app itself.
+- Cloudflare's documentation gives the free plan's minimum edge time as 2 hours, but Cache Rules evidently allow less
+  (60 s and 10 s rules expire on time in production). If a short time were ever ignored, a page would simply stay
+  longer, and a purge clears it.
+- Each Cloudflare location keeps its own copy; Tiered Cache and the warmer make the origin see about one request per
+  page per cache time, not one per location.
+
+## Client IP inside the apps
+
+Behind Cloudflare → ServiceLB → Traefik, an app receives `X-Forwarded-For: <visitor>, 10.42.x.x`. Trust **2** hops
+(`TRUST_PROXY=2` or equivalent), never the left-most entry (the client can forge it) or `X-Real-Ip` (that's the
+internal ServiceLB address). `CF-Connecting-IP` is the most reliable, and per-IP rate limits in Traefik key on it.

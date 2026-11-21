@@ -1,0 +1,80 @@
+---
+title: Claude Code workflow
+description: How Claude Code operates the platform - CLAUDE.md rules, skills, subagents, HUMAN.md hand-offs, permission checks, auto-commit and post-mortems.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+The platform anvil grew out of was built in about ten days and is run with Claude Code as the operator ([History](/history/)): it wrote the Terraform, the manifests, the
+scripts and these docs' sources, deployed every change, and was paged (through the autopilot) by its own mistakes.
+What made that work is mostly **written rules**, not cleverness.
+
+## `CLAUDE.md`: the operator's manual
+
+Loaded into every session. anvil's holds:
+
+- what the system is (one paragraph), where things live, which files are the source of truth;
+- what Claude is **authorized** to do without asking (`terraform apply` after reading the plan) and what it must
+  never do without asking (destroy or replace the server or its IP);
+- the [rules for every app](/reference/app-rules/), each with the incident that taught it;
+- how to bootstrap (the skills, in order), secrets, monitoring and how to stop calls, and gotchas (SMTP ports blocked,
+  keys without expiry, stale Google DNS, the permission checks).
+
+Rules are written as **what to do and why**, with the incident attached ("an API sat 3 days unable to start …").
+A rule with its reason survives better than a bare instruction, for people and models alike.
+
+## Hand-offs: `HUMAN.md`
+
+Some steps need a human: a dashboard login, a payment, a decision, a nameserver change at a registrar without API
+access. Claude writes them into `HUMAN.md` as tasks with `id`, `status`, `depends`, `why`, numbered `steps` (exact
+clicks and commands) and `verify`, then continues with everything that doesn't depend on them. The queue holds
+**only** blocked steps: anything Claude can run itself, it runs. `HUMAN-PINNED.md` (a secret file, encrypted twin
+in git) is the owner's quick reference: links, logins, the status code.
+
+## Permission checks are a feature
+
+Claude Code's auto-mode permission check blocked some actions on the original platform: `terraform apply` on the
+first night (even though `CLAUDE.md` allowed it), bulk deletes in production (database
+rows, volumes, cloud resources), some DNS changes, using someone else's credentials, downloading a binary from an
+unvetted URL, starting the autopilot for the first time, even a read-only row count before a data wipe. The rule is **don't work around it**: write the exact command into `HUMAN.md` for the owner. Every
+block was on an action where a second pair of eyes was worth a minute.
+
+## Skills and commands
+
+| Skill / command | What it does |
+|---|---|
+| `update-images` | updates every app's packages, rebuilds and publishes its images (one subagent per repo, never deploying), then stops for your approval of a confirmation file before releasing; `repos.yaml` lists each repo and its images |
+| `/security-audit` (original platform) | a structured, read-only audit: 11 areas, ~90 checks (infrastructure, cluster, each app's deployment, edge, secrets, monitoring, backups, the home machine, the laptop); findings with severities; never prints secrets |
+| bootstrap skills `00-preflight` … `99-teardown` | stand up / tear down anvil, each step self-checking ([Bootstrap skills](/quickstart/bootstrap-skills/)) |
+| autopilot skills | `triage`, `restart`, `rollback`, `free-disk`, `rerun-job`, `mac-services`, `report` (in the autopilot image) |
+
+**Subagents** do independent work in parallel (one per repo for image updates, reviews, research) and return only a
+summary, which keeps the main session's context for decisions.
+
+## Auto-commit and post-mortems (original platform)
+
+These run on the original platform's laptop; they aren't in anvil's repo yet.
+
+- **Auto-commit** (a systemd timer, plus on shutdown): commits and pushes the repo after 45 quiet minutes (in env), with a
+  Claude-written description (a cheaper model) scrubbed by gitleaks; without gitleaks, a plain file list. The
+  autopilot then always clones an up-to-date copy.
+- **`scripts/postmortem`**: appends a post-mortem entry (what happened, what was done) to the log behind `/changelog`.
+  The autopilot writes one per run; Claude writes one after a human-led incident.
+
+## Habits that paid off
+
+- **Plan before apply, always**: read every `terraform plan`; never apply one that replaces the server.
+- **Deploy from a clean worktree** of the commit (`git worktree add --detach … <sha>`), never from a tree holding
+  someone's unfinished changes.
+- **Build and deploy so a failure stops everything** (`set -euo pipefail`): a failed build once left a manifest
+  pointing at an image that was never pushed.
+- **Verify like a visitor**: through Cloudflare, with `curl --resolve` to a Cloudflare IP, and `/cluster` green
+  afterwards ([rule 13](/reference/app-rules/#13-watched-before-it-counts-as-deployed)).
+- **Throwaway things start with `zz-`** and are deleted the same session.
+- **Re-verify dated research** before relying on it (versions and URLs rot), and HEAD-request an artifact rather
+  than trusting a summary of a directory listing.
+
+<Aside type="note">
+Long-lived multi-session queues (one file per concurrent Claude session) were used during the migration and are kept
+only as history; `HUMAN.md` is the queue that stays.
+</Aside>

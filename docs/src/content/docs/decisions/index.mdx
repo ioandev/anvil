@@ -1,0 +1,22 @@
+---
+title: Why decisions are written down
+description: The ADR-style records behind anvil's main choices - context, decision, consequences and the alternatives that lost.
+---
+
+import { LinkCard, CardGrid } from '@astrojs/starlight/components'
+
+Each page below is a short architecture decision record: **context** (what forced a choice), **decision**,
+**consequences** (good and bad) and **alternatives** considered. They exist so that the next person (or the next
+Claude session) doesn't re-litigate a choice without knowing why it was made, and can change it knowingly when the
+context changes.
+
+<CardGrid>
+  <LinkCard title="Scaleway" href="/decisions/scaleway/" description="EU, cheap, local SSD, Object Storage, registry and email in one account." />
+  <LinkCard title="Flatcar + k3s" href="/decisions/flatcar-k3s/" description="An immutable OS configured once; one-binary Kubernetes on one node." />
+  <LinkCard title="Cloudflare Free + own-CA origin pulls" href="/decisions/cloudflare/" description="Only your zones can reach the origin; no token on the server." />
+  <LinkCard title="One shared MariaDB" href="/decisions/shared-mariadb/" description="One instance, one database and two users per project." />
+  <LinkCard title="SOPS in git" href="/decisions/sops-in-git/" description="Secrets versioned with the code, one key as the root of trust." />
+  <LinkCard title="Phone calls, not email" href="/decisions/phone-calls/" description="An alert you can sleep through is not an alert." />
+  <LinkCard title="An autopilot with guardrails" href="/decisions/autopilot/" description="Let Claude fix the easy incidents, and only the easy ones." />
+  <LinkCard title="Labels, not renames" href="/decisions/labels-not-renames/" description="Keep names stable; add standard labels for grouping." />
+</CardGrid>

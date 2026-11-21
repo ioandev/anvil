@@ -1,0 +1,176 @@
+# atlas: the one shared MariaDB for every project (merged 2026-10-18; it holds
+# everything up). Each project keeps its own database (schema) and gets exactly
+# two users, limited to that database:
+#   <project>_rw   app user: read/write + the DDL its migrations need
+#   <project>_ro   read-only (SELECT, SHOW VIEW)
+# Users/grants are (re)applied from the secrets with `scripts/node.sh atlas-users`.
+# Apps connect to atlas-mariadb.atlas:3306 with their per-namespace secret
+# "atlas-db" (DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD; scripts/make-secrets.py).
+# root only works from inside the pod (MARIADB_ROOT_HOST=localhost).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: atlas
+  labels: { app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlas-mariadb
+  labels: { app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: atlas
+spec:
+  selector: { app: atlas-mariadb }
+  ports: [{ name: mysql, port: 3306 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: atlas-mariadb
+  labels: { app.kubernetes.io/name: atlas-mariadb, app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: database }
+  namespace: atlas
+spec:
+  serviceName: atlas-mariadb
+  replicas: 1
+  selector: { matchLabels: { app: atlas-mariadb } }
+  template:
+    metadata: { labels: { app: atlas-mariadb, app.kubernetes.io/name: atlas-mariadb, app.kubernetes.io/part-of: atlas, app.kubernetes.io/component: database } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsUser: 5450, runAsGroup: 5450, fsGroup: 5450 }
+      containers:
+        - name: mariadb
+          image: mariadb:13.0.2
+          args:
+            - --character-set-server=utf8mb4
+            - --collation-server=utf8mb4_unicode_ci
+            - --innodb-buffer-pool-size=128M   # all data + indexes fit many times over; ~380 MB back for the apps
+            - --max-connections=300
+            - --max-allowed-packet=64M
+            # Full-text search: index 2-letter words, no stopword list (server-wide settings).
+            - --innodb-ft-min-token-size=2
+            - --innodb-ft-enable-stopword=0
+            - --performance-schema=OFF
+            # Binary log, for moving a project's database to its own server with a live sync and a brief cutoff
+            # (scripts/move-db). It records ONLY the databases listed in --binlog-do-db (generated from the projects with
+            # `move:` in sites.yaml): a sync login and the receiving server never see other projects' changes. A new
+            # entry there means one atlas restart. Caveat (tested on the original server): a schema change made without
+            # `USE <db>` first isn't logged; migrations connect to their own database.
+            - --server-id=1
+            - --log-bin=atlas-bin
+            - --log-basename=atlas
+            - --binlog-format=ROW
+            - --gtid-strict-mode=ON
+            - --binlog-expire-logs-seconds=172800
+            # BEGIN generated from sites.yaml by scripts/sites.py render: edit sites.yaml, not this
+            - --binlog-do-db=anvil_demo
+            # END generated
+          env:
+            - { name: MARIADB_ROOT_PASSWORD, valueFrom: { secretKeyRef: { name: atlas-root, key: MARIADB_ROOT_PASSWORD } } }
+            - { name: MARIADB_ROOT_HOST, value: localhost }
+            - { name: MARIADB_AUTO_UPGRADE, value: "1" }
+          ports: [{ name: mysql, containerPort: 3306 }]
+          resources: { requests: { cpu: 200m, memory: 768Mi }, limits: { memory: 1536Mi } }
+          readinessProbe: { exec: { command: ["healthcheck.sh", "--connect", "--innodb_initialized"] }, periodSeconds: 10 }
+          livenessProbe: { exec: { command: ["healthcheck.sh", "--connect", "--innodb_initialized"] }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          volumeMounts: [{ name: data, mountPath: /var/lib/mysql }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources: { requests: { storage: 30Gi } }
+---
+# Nightly off-site backup (platform/backup/server-backup.sh) to the ${ANVIL_NAME} backup bucket; emails on failure.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: atlas-backup
+  labels: { app.kubernetes.io/name: atlas-backup, app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: backup }
+  namespace: atlas
+spec:
+  schedule: "30 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          enableServiceLinks: false
+          restartPolicy: Never
+          imagePullSecrets: [{ name: anvil-registry }]
+          securityContext: { runAsUser: 5480, runAsGroup: 5480 }
+          containers:
+            - name: backup
+              image: ${ANVIL_REGISTRY}/anvil-backup:${ANVIL_BACKUP_TAG}
+              args: ["mariadb"]
+              envFrom: [{ secretRef: { name: server-backup } }]
+              resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 512Mi } }
+              securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+              volumeMounts:
+                - { name: work, mountPath: /work }
+          volumes:
+            - { name: work, emptyDir: {} }
+---
+# Morning watchdog for the nightly backups: a job that never starts (image pull, missing/expired key, scheduling)
+# can't send its own failure email. This asks the API when each backup CronJob last succeeded and emails if any
+# is older than 26 h; on Mondays it also emails "backups OK", so if that email stops, the watchdog is broken too.
+# Its service account may only read these three CronJobs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-watch
+  labels: { app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: atlas
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: backup-watch
+  labels: { app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  # read-only: list the backup CronJobs in every namespace (found by label) and read their last success
+  - { apiGroups: [batch], resources: [cronjobs], verbs: [get, list] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: backup-watch
+  labels: { app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: backup-watch }
+subjects: [{ kind: ServiceAccount, name: backup-watch, namespace: atlas }]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: backup-watch
+  labels: { app.kubernetes.io/name: backup-watch, app.kubernetes.io/part-of: atlas, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: atlas
+spec:
+  schedule: "0 8 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        spec:
+          enableServiceLinks: false
+          restartPolicy: Never
+          serviceAccountName: backup-watch
+          imagePullSecrets: [{ name: anvil-registry }]
+          securityContext: { runAsUser: 5483, runAsGroup: 5483 }
+          containers:
+            - name: check
+              image: ${ANVIL_REGISTRY}/anvil-backup:${ANVIL_BACKUP_TAG}
+              args: ["check"]   # every CronJob labelled app.kubernetes.io/component=backup
+              envFrom: [{ secretRef: { name: server-backup } }]
+              resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+              securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: [ALL] } }
+              volumeMounts: [{ name: work, mountPath: /work }]
+          volumes: [{ name: work, emptyDir: {} }]

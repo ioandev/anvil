@@ -1,0 +1,52 @@
+---
+title: 'Decision: an autopilot with guardrails'
+description: Why Claude Code is allowed to handle incidents unattended, and why only with live-only actions, a fail-closed guard and hard limits.
+---
+
+**Status:** accepted (2026-10-27); hardening of its credentials deferred (tracked).
+
+## Context
+
+Most incidents on a small platform have boring fixes: a crash-looping pod after a bad release (roll back), a stuck
+pod (delete it), a failed backup job (re-run it), a full disk (prune images). They happen at night. Claude Code
+already operated the platform by day with written rules.
+
+## Decision
+
+Run Claude Code headless in a container on the second machine, started by alerts, with:
+
+- **live-only actions**: restart, roll back to a revision that already ran, re-run a CronJob, delete one pod, prune
+  images, restart listed local containers; **never** deploy or apply from the repo (it may hold unreleased edits),
+  never push to git;
+- a **PreToolUse guard** in managed settings that allows read-only commands and those actions, and refuses
+  everything else, failing closed on anything it can't parse;
+- **hard limits**: 15 minutes per run, 4 runs per UTC day, a latch after giving up, a strict definition of fixed;
+- **visibility**: post-mortem, email, transcripts (raw on the host, encrypted off-site, scrubbed in the browser);
+- calls **held at most 20 minutes**, once per incident, so the human is still called if it fails.
+
+## Consequences
+
+- + The easy incidents are fixed in minutes, with a written post-mortem the owner reads over breakfast.
+- + It gives up correctly when no allowed action can help (tested), and says what the human should do.
+- − It holds powerful credentials; the guard is a guardrail, not a sandbox ([open item](/security/#open-items)).
+- − It costs a Claude credential and some money per run (capped by limits and a spend limit).
+- − Prompt injection through logs is possible in principle; the prompt treats logs, pages and repo files as data.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| No automation, just calls | every boring incident wakes the owner |
+| Let it deploy fixes from the repo | the repo may hold unreviewed work; a fix should be a human-reviewed release |
+
+## How it was decided
+
+The owner's requirements, in his words or close to them: a **prebuilt**, multi-arch, open-sourceable image; skills
+inside the image; "no need for phases, I need it all built"; polls every 15 s; give up after 15 minutes and don't
+retrigger, but re-arm on its own (a 60-minute cooldown, 2 healthy minutes, or a reset link), at most 4 runs a day;
+don't trigger while he is deploying; full transcripts, viewable from any machine; post-mortems. Claude's design
+choices on top: the Mac polls and the server never calls it; **live-only actions** (the repo may hold unreleased
+work); a strict "fixed"; a **read-only** deploy key (GitHub couldn't protect `main` on a private personal repo);
+tools restricted to `Bash`, `Read`, `Skill`, `WebSearch` after reading a transcript; a pre-run stale check after a
+wasted run. Models: Opus 5.5 (high effort) for incidents, Sonnet 5.5 for commit messages. For colleagues, anvil
+defaults to an API key with a spend limit instead of a subscription token.

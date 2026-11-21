@@ -1,0 +1,118 @@
+---
+title: Lessons learned
+description: The outages, self-inflicted pages, Claude's own mistakes and the traps behind anvil's rules - what happened, the impact, the fix, and the rule it produced.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+Every rule in anvil has a story. These come from building and running the platform anvil grew out of (October
+2026), with Claude Code doing most of the work. Projects are anonymised. Each entry: **what happened → impact →
+fix → the rule it left behind.**
+
+<Aside type="note" title="Claude's mistakes are in here on purpose">
+Several of the worst incidents were caused by the operator itself: a wrong probe port that phoned the owner at
+night, a silence removed too early, source code copied where it didn't belong, a guessed timing presented as fact.
+They're listed candidly because the rules they produced are the most useful part of anvil.
+</Aside>
+
+## The top ten
+
+| # | What happened | Impact | Fix | Rule it produced |
+|---|---|---|---|---|
+| 1 | An API's Secret was never created on the new server. Its pod sat in `CreateContainerConfigError`. health-watch even wrote it to the error latch, but nothing escalated. | **3 days** down, unnoticed until a user tried to log in | created the Secret (with every key the app reads) | kube-state-metrics + `PodCannotStart`/`ServiceUnavailable`; probes for every server-side route; `/cluster` in `/overall`; rules 13 and 14. *Detection without escalation is not monitoring.* |
+| 2 | Claude gave the new kube-state-metrics a liveness probe on the wrong port (`/livez` is on 8080, it used 8081 → 404). It restart-looped and `PodRestartingOften` fired. | the owner was **phoned twice at night**, by the monitoring about itself | fixed the port; sent "resolved" straight to twilio-alert; pod rules now count only pods that still exist | rule 15: curl a probe endpoint from inside the cluster first |
+| 3 | Minutes later Claude expired the silence while Alertmanager still held the alert (a restarted Prometheus never sends "resolved" for what it was firing). | **a third call** | let silences run out | check `amtool alert query` before removing a silence; [runbook](/operations/silence-alerts/#removing-a-silence-safely) |
+| 4 | An email API key had been created with an expiry date. It died silently (`535 … token is expired`); sign-up confirmations failed and gave up after 2.5 minutes. | **2 days** of failed emails, 9 users stuck, only visible in logs | a stopgap key; the 9 emails re-queued; retries spread over 24 h | cloud keys **without expiry** (`00-preflight` checks it); a status endpoint that turns red when the watcher itself goes quiet |
+| 5 | A generic Service name (`backend:4000`) on the previous server resolved to three projects' backends and round-robined between them. | a real outage | unique names | rule 2: project-prefixed Service names; `sites.py check` enforces it |
+| 6 | Kubernetes injected docker-link env vars (`RELAY_PORT=tcp://…`) that overwrote an app's own `*_PORT`. | crash loop on the first night | `enableServiceLinks: false` | rule 5 |
+| 7 | The copied base repo used Let's Encrypt DNS-01, so an **account-wide** Cloudflare token (could create tokens, change billing) sat in a Kubernetes Secret, the Terraform state and the instance metadata. Asked why, Claude said: "Because it came with the repo I copied, and I didn't question it." | a token that could take over every domain, on the server | Origin CA certificates (15 years), the token removed from the server and state, a least-privilege token, the old one revoked (within ~10 minutes) | no ACME and **no Cloudflare token on the server**; audit inherited defaults |
+| 8 | Cloudflare was reachable only from Cloudflare's IPs, but **any** Cloudflare customer can point a zone at your IP, and Cloudflare's shared origin-pull certificate is presented for all of them. | the origin was reachable through other people's zones | Authenticated Origin Pulls with **our own CA**; Traefik refuses handshakes without it | [two locks on the origin](/components/edge/#two-locks-on-the-origin) |
+| 9 | A domain was cut over minutes before Cloudflare had issued its edge certificate. | the site's PWA showed "offline"; every HTTPS handshake failed | waited for the certificate pack, cut over again | never cut over before `certificate_packs` is `active`; verify through a Cloudflare IP (rule 9) |
+| 10 | After nameserver moves, Google Public DNS kept serving the old registrar's answers (still authoritative there; parent TTL 2 days). | visitors sent to the dead old server | the owner flushed Google's cache (a captcha: a person's job) | check `dns.google/resolve`; stop the old server only after it's correct |
+
+## Capacity and load tests
+
+From a ceiling test and the weeks around it on the original server (November 2026).
+
+| What happened | Impact | Fix → rule |
+|---|---|---|
+| A website's readiness probe rendered the home page with Kubernetes' default 1-second timeout. Under load the page took longer, Kubernetes marked the only website pod not ready, and Traefik answered 503 to every page until the check passed again. | **"slow" became "down"**: 5.5% of requests failed in the first run, all pages | readiness = a **port check**; liveness renders the real page with 10 s / 5 failures. The same overload then gave slow answers and 0 errors → `CAPACITY.md` rule 1, the app template |
+| A Rust API's image had no `sleep` binary, so its `preStop: exec sleep 5` failed on every rollout for days (`FailedPreStopHook`), unnoticed. | requests dropped on every deploy | Kubernetes' built-in `preStop: { sleep: { seconds: 5 } }` everywhere → never `exec sleep` in a minimal image |
+| A blog's pages were cached at the edge, but Next.js resized its images per screen width with `max-age=60`, and the page rule covered anonymous visitors for a few minutes only. A phone kept getting a `MISS` and waited for the server to resize the header again. | about **1.35 s** for one image on a phone | build files and resized images cached a day for everyone; 8 hours of sampling afterwards: every sample a `HIT`, none over 1 s → [Edge caching](/components/edge/#worked-example-a-slow-page-on-a-phone) |
+| The first CPU alert used `1 − average idle`. After the node-exporter pods were replaced twice in a few minutes, short-lived series with near-zero rates read as 100% busy. | a false **72–84%** while the node was about 40% busy | busy = (all − idle) ÷ all, each summed per node → [the CPU figure](/components/monitoring/#why-the-cpu-figure-is-all--idle--all) |
+| The autopilot's email said `FIXED` for runs that changed nothing: the alerts had cleared by themselves. | of the first 52 runs, 40 changed nothing and 5 repaired something; "fixed" overstated it | the run viewer and the email tell **repaired** (changed something) from **cleared by itself**; the causes of the blips were removed rather than the autopilot silenced → [Autopilot](/components/autopilot/#fewer-runs-not-a-quieter-autopilot) |
+| One failed probe turned `/cluster` red for 5 minutes (it meant "failed at least once"), which started the autopilot, which found everything healthy. | most of about 15 runs a day | down = more than half of the last 5 minutes of probes failed; pending alerts must be 2 minutes old before a run |
+| webhookd never reaped the hook scripts it started (an orphaned `timeout` outlived each database check). | up to 9,565 zombie processes, about 100 MB of kernel memory | `shareProcessNamespace: true`: the pause process is PID 1 and reaps them |
+| During a ceiling test, a pool was resized to 8 and then 16 cores without asking, because the next step "seemed obvious". | €0.44 of the €1.90 the whole testing cost (nine runs, a rehearsal, about 2 hours of hourly servers); each resize also restarts the server and starts a new billed hour | **never a bigger server without the owner's yes**: say the size, its hourly price and that a resize restarts it; `scripts/pool type` refuses without `POOL_TYPE_CONFIRMED=1` → [the money rules](/operations/scale-out/#the-money-rules) |
+| A router restart in `kube-system` during a test wasn't covered by the test's silence. | a phone call at night | silence every namespace a test touches, `kube-system` included; the load-test script stops k6 when a real site's probe fails |
+| A load-test copy that couldn't start crash-looped, and `PodRestartingOften` fired: the cluster-wide alerts watch every namespace. | almost a phone call | `scripts/loadtest up` scales a copy that isn't ready in 4 minutes to 0 |
+
+## Monitoring and alerting
+
+| What happened | Impact | Fix → rule |
+|---|---|---|
+| A replaced pod's old restart count kept `PodRestartingOften` firing for 30 minutes. | repeated pages | rules count only pods that still exist (`and on (namespace, pod) kube_pod_info`) |
+| A silence stopped new notifications but not twilio-alert's own call schedule. | calls continued after "muting" | POST "resolved" to twilio-alert, or pick up (60-min pause); documented |
+| The pager's answer semantics flip-flopped: "anything counts", then "voicemail counts", then, **during a live 3 a.m. test**, "if it goes to voicemail it should call again". Claude re-enabled answering-machine detection inside the 10 minutes before the call. | none (caught in the test) | voicemail doesn't count; confirm alerting semantics with a real end-to-end test |
+| A test call answered would have paused real alerts for 60 minutes. | a test could mask a real incident | test calls only log, never snooze, bypass quiet hours |
+| Deploys in progress looked like outages; owner asked "don't page me while I'm working on it". | false alarms | rules ignore workloads created/changed in the last 10 min (from kube-state-metrics, whatever deployed them), then `for: 5m` |
+| The autopilot's own rollback is also a "recent change", so it would have hidden the alert and reported "fixed". | a false "fixed" | "fixed" needs the strict check (`/cluster?strict=1`, no exceptions) to pass twice |
+| `/overall` returned 200 while backups were red (an exit status lost inside `$( … )`); then a loop variable named `code` overwrote the secret `code`. | wrong status | caught by Claude's own tests before hand-over; test status endpoints with real failures |
+| A mounted ConfigMap isn't refreshed in a running pod at once, so new hooks returned 404; a config change also left a backup job logging in as root after the database merge. | stale config | `node.sh deploy` fingerprints config and restarts exactly what changed (rule 16) |
+| UptimeRobot showed red: its monitors had no `?code=`. | confusing, not an outage | by design: no code = bare 500 |
+| webhookd at DEBUG logged every request's `?code=`, readable in the log viewer by anyone on the tailnet. | secret in logs | log level info, http module only |
+| The always-firing `Watchdog` alert confused the owner ("firing, yet no calls"). | none | documented: firing = healthy heartbeat |
+
+## Backups and data
+
+| What happened | Impact | Fix → rule |
+|---|---|---|
+| The first backup run used rclone, which needs list/HEAD; the key is write-only. | the night failed, **6 real failure emails** (which proved the alert path) | plain signed `curl` PUTs |
+| A job that never starts can't email about itself (a note the owner pasted in). | silent gaps | `backup-watch` at 08:00 (26 h check) + a Monday "backups OK" mail as a dead-man switch for the watcher |
+| Eleven MariaDB instances used ~2 GB of RAM for **38 MB** of data; 0.9 GB was left free. | near memory pressure | one shared MariaDB with two users per project: ~1.5 GB back, about 2 minutes of downtime per app during the move |
+| The merge script switched one app to its new DB secret before the secret existed in the cluster; another app's dump folder was missing. | ~4 min and a few minutes down | create secrets and folders before the switch; one app at a time limited the blast radius |
+| All database passwords had been reused from the old server, some exposed in git history. | weak credentials | every password regenerated at the merge |
+| An unrelated app's 265k-row table had no index and was full-scanned twice a second, on a host losing 28–39 % CPU to steal. | the blog took up to 2 s | one online index (kept in a post-restore SQL file) + a 60 s edge cache: ~0.25 s, no bigger server |
+
+## Infrastructure and machines
+
+| What happened | Impact | Fix → rule |
+|---|---|---|
+| k3s' installer downloaded the binary, then failed on Flatcar (SELinux permissive, but a missing `k3s-selinux` policy is fatal). | no k3s on first boot | `INSTALL_K3S_SKIP_SELINUX_RPM=true` + `INSTALL_K3S_SELINUX_WARN=true` |
+| An LLM summary of Flatcar's release listing (and the docs) said the stable channel had no Scaleway image. | wrong conclusion | HEAD-request the artifact itself |
+| A slow JVM needed ~70 s to start; Claude's liveness probe killed it at 60 s; inotify instances (128) were also exhausted. | a 7-minute restart loop | startup probe; generous liveness (rule 11: 120/30/10/5); inotify limits in Butane |
+| A failed image build (disk full) left the manifest pointing at an image never pushed. | the rolling update kept the old pod: no outage, by luck of the strategy | `set -euo pipefail`; `build-images` stops on failure and refuses dirty trees |
+| `podman image prune -a` removed more than intended; the build machine's disk filled several times. | rebuilds | never `-a`; check `df` before building; delete local copies after pushing |
+| `node.sh deploy` said `unchanged` although things changed (it applies twice); Claude explained it as "another session deployed at the same moment". | a wrong explanation | verify the live object; the corrected explanation is documented |
+| An interactive `cp` alias waited for "yes" and hung a script; an SSH loop swallowed stdin. | stuck commands | `command cp -f`; `</dev/null` on remote commands |
+| `pkill -f <pattern>` killed its own shell (the pattern was in its own command line). | a killed command | kill by PID |
+| Outbound SMTP (25/465/587) is blocked on Scaleway instances. | confirmation emails timed out | Transactional Email on port 2587 or its HTTP API |
+| A home-network database with default root password was found open on the LAN during an inventory of the home machine. | exposure on the LAN | shut down; the home machine runs only what the repo describes |
+
+## Working with Claude Code
+
+| What happened | Impact | Fix → rule |
+|---|---|---|
+| Claude copied an app's **source code to the Mac** to avoid a registry login. The owner: "why is the source code deployed???" | source on a target machine | built images on the laptop, shipped with `docker load`, deleted the copy → **no source on target machines**; `home-deploy` ships only configs and images |
+| In zsh, `scp … $M:folder` applied the `:r` modifier and wrote a `.env` with a relay key into a local folder inside the repo. | a secret in the working tree (never committed) | deleted → write `"${M}:path"` |
+| Claude said two app versions would overlap for "about a minute" during a deploy. It was a guess. Measured: 13 s; the owner asked for 15 s; tuned to **9.6 s**, proven with 453 and 219 requests (0 errors). | a wrong number stated as fact | measure before claiming → numbers in docs come from measurements |
+| Claude estimated Grafana at 100–150 MB; it uses 250–320 MiB. | a wrong sizing | reported candidly; a memory limit of 425 MiB → same |
+| The autopilot's session listed tools (cron, remote triggers, web fetch, file edit) that the Bash-only guard never saw. Found by reading a transcript line by line. | a prompt-injection path around the guard | `--tools Bash,Read,Skill,WebSearch` (`--allowedTools` only auto-approves under bypass mode; `--tools` removes) → restrict tools, not just commands |
+| A GitHub access test **pushed to `main`** with the autopilot's key: branch protection isn't enforced on private personal repos without a paid plan. | an empty commit on main | a **read-only** deploy key; the autopilot never pushes → enforce with credentials, not policy |
+| The autopilot's model had never been pinned (account default). | unknown cost/behaviour | Opus 5.5 high for incidents, Sonnet 5.5 medium for commit messages → pin the model |
+| A run started on alerts that had already cleared (Claude reset the autopilot right after deleting a test namespace). | a wasted run | pre-run check: if the strict status is green, don't start |
+| A secret pasted only in chat (no file) would have escaped the scrubber; writing it to a new file was blocked by the permission check. | a possible leak in commit messages | the scrubber compares against every value in the vault (432 values) → scrub against the vault, not just regexes |
+| The permission check blocked `terraform apply` on night one (even with written permission), nameserver changes, copying secrets off the old server, bulk deletes, a read-only count before a data wipe, starting the autopilot. The agent stopped and wrote exact commands for the owner. | minutes of human work each time | none needed → **don't work around it**: `HUMAN.md` with exact commands |
+| A `HUMAN.md` task said "wait: zones don't exist yet"; it was run anyway. | three domains started going offline | reverted, then redone with **per-zone** nameservers → nameservers differ per zone; never before the zone exists |
+| A path-routed app on a shared host was forgotten in a cutover. | `/<app>` 404 for ~2 hours | redeployed → inventory path routes, not just hostnames |
+| Production wasn't what git said: an app whose real code was never committed (HEAD was the framework's boilerplate), another built from a months-old branch, the pager's live code only in an uncommitted tree. Found by the update-images subagents. | a rebuild would have shipped the wrong thing | snapshot before updating → image tags name the exact commit; dirty builds never released |
+| A subagent ran `podman login` with another registry namespace's key and replaced the shared login mid-run. | other subagents got "access denied" | credentials per command only |
+
+## The old server
+
+| What happened | Fix → rule |
+|---|---|
+| Its certificate renewals had silently died: five sites were serving expired certificates for weeks. | 15-year Origin CA certificates; alerts on what users see |
+| A Discord bot ran outside Docker and outside the repo; only a read-only audit of the host found it. | audit the host, not just the repo, before decommissioning |
+| Bots in a compose **profile** survived `docker compose down` and were assumed stopped (so never migrated). | prove what runs; singletons start at 0 replicas until the old copy is stopped |
+| A test request still reached the old server after a DNS flip (another record in the zone routed it). | prove where a request lands with a uniquely tagged request |

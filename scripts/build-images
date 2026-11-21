@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Build and push anvil's own images to $ANVIL_REGISTRY, then record their tags in anvil.env (ANVIL_<NAME>_TAG), which
+# the manifests use (${ANVIL_BACKUP_TAG} …). Tags: scripts/image-tag (<YYYYMMDD>-<sha>; never reused).
+#   scripts/build-images name=dir [name=dir ...]      e.g. anvil-demo=demo   (make images builds them all)
+# twilio-alert is built for amd64 + arm64 under one tag (the home machine's watchdog runs it); the rest amd64 only.
+# Stops on the first failure (a manifest must never point at an image that wasn't pushed). Needs podman.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; . ./anvil.env; set +a
+: "${ANVIL_REGISTRY:?set ANVIL_REGISTRY in anvil.env (40-platform creates the registry namespace)}"
+host=${ANVIL_REGISTRY%%/*}
+podman login --username nologin --password-stdin "$host" <<<"$SCW_SECRET_KEY" >/dev/null
+
+for spec in "$@"; do
+  name=${spec%%=*} dir=${spec#*=}
+  tag=$(scripts/image-tag "$dir")
+  [[ $tag == *-dirty-* ]] && { echo "$name: $dir has uncommitted changes; commit first (dirty builds are for testing only)"; exit 1; }
+  ref="$ANVIL_REGISTRY/$name:$tag"
+  if [[ $name == twilio-alert ]]; then arches="amd64 arm64"; else arches="amd64"; fi
+  podman manifest rm "$ref" >/dev/null 2>&1 || true
+  podman manifest create "$ref" >/dev/null
+  for a in $arches; do
+    echo "== $name ($a) from $dir"
+    podman build --platform "linux/$a" -t "$ref-$a" "$dir"
+    podman manifest add "$ref" "containers-storage:$ref-$a" >/dev/null
+  done
+  podman manifest push --all "$ref" "docker://$ref"
+  case $name in
+    anvil-backup) var=ANVIL_BACKUP_TAG ;; twilio-alert) var=ANVIL_TWILIO_TAG ;; anvil-demo) var=ANVIL_DEMO_TAG ;;
+    *) var="ANVIL_$(echo "${name#anvil-}" | tr 'a-z-' 'A-Z_')_TAG" ;;
+  esac
+  python3 -I scripts/anvil-secrets set "$var=$tag" >/dev/null
+  echo "pushed $ref ($var=$tag)"
+  for a in $arches; do podman rmi "$ref-$a" >/dev/null 2>&1 || true; done   # disk: keep only the registry copy
+done

@@ -1,0 +1,16 @@
+# Cloudflare Origin CA certificates (scripts/origin-certs.py): one per zone,
+# zone + *.zone, valid to 2041. Traefik picks one by SNI from this default TLS
+# store. Cloudflare trusts them in Full (strict); browsers never see them, since
+# only Cloudflare can reach the origin (Authenticated Origin Pulls). No ACME and
+# no Cloudflare token on the server.
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  labels: { app.kubernetes.io/part-of: origin-ca, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: kube-system
+spec:
+  certificates:
+    # BEGIN generated from sites.yaml by scripts/sites.py render: edit sites.yaml, not this
+    - secretName: origin-ca-${ANVIL_DOMAIN}
+    # END generated

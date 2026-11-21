@@ -1,0 +1,66 @@
+---
+title: History
+description: How the platform anvil comes from was built in about ten days, with Claude Code as the operator - a generic timeline, the working pattern, and the numbers.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+anvil is the generic copy of a private platform that one person built in **about ten days in October 2026**, with
+Claude Code doing nearly all of the hands-on work: research, Terraform, manifests, scripts, migrations, monitoring,
+the autopilot, and the notes these docs are written from. The owner set direction, made the decisions, did what only
+a person can do (dashboards, payments, captchas, nameservers, picking up the phone), and corrected course often.
+
+## Timeline
+
+| When | What |
+|---|---|
+| **Day 1, evening** | Chose the instance from Scaleway's public product API (a DEV1-L: cheapest x86 with 8 GB and local SSD; Flatcar's image is x86). Copied a small Flatcar + k3s Terraform repo as the base. Mirrored every DNS record into new Cloudflare zones **before** touching nameservers. The server was up ~20 minutes after the first apply attempt; the first four projects were live and tested on the box about 20 minutes later, and **12 sites were cut over about two hours after the server existed**. |
+| Day 1, night | SSH moved to an odd port (listening on both ports until the new one was confirmed: no lockout window); Authenticated Origin Pulls with an own CA; unique Service names and UIDs; no service links; secrets out of scripts into per-app files; data out of git; Dozzle on Tailscale only; a 2 GB swapfile; the account-wide Cloudflare token found on the server and replaced by Origin CA certificates; **SOPS + age** for secrets in git. |
+| Day 2, early | More projects from three small servers; the "ghost domain" and the edge-certificate traps; a slow JVM killed by a too-eager liveness probe. ~21 projects on one 8 GB server, with **0.9 GB of RAM left**. |
+| Day 2 | **Eleven MariaDB instances merged into one** shared MariaDB with two users per project and fresh passwords (~1.5 GB of RAM back); cloud leftovers removed; image GC thresholds; a real app deployed on the shared database with its helper on the home machine. |
+| Days 3–6 | Releases of that app; email through Scaleway TEM after finding outbound SMTP blocked; a silent two-day email outage from an expired key. |
+| Day 7 | Nightly off-site backups of every database with a **write-only key**, the morning watchdog and the Monday "OK"; status endpoints behind a code (`/overall`, `/space`, `/database`, `/backups`); `www` redirects; liveness probes for 31 apps and k3s restarting forever. |
+| Day 8 | **Zero-downtime deploys**, measured (9.6 s overlap, 0 failed requests); graceful shutdown checked; **phone alerts** (Prometheus, Alertmanager, blackbox, twilio-alert) and the home machine's watchdog, proven with a real end-to-end test at night; multi-arch images; the `update-images` skill (18 repos, 36 images in one sweep). Grafana on the tailnet. |
+| Days 9–10 | Quiet days; a read-only `/security-audit` command (11 areas, ~90 checks). Day 8 had also seen four zero-downtime releases of the real app. |
+| Day 11 | A three-day-old outage found by a user → kube-state-metrics and cluster-wide rules, then the monitoring paged the owner three times about its own mistakes (and the rules got better); a vault on the home machine; config-hash restarts; the **autopilot** designed, built by subagents against a written interface, and tested live twice (fixed a bad release in 2 min 18 s; correctly gave up on a missing secret in 76 s); then the plan for anvil and the refactor that gave both repos one layout. |
+
+<Aside type="note">
+Day numbers are counted from the first evening. The original platform is private; anvil is built from its refactored
+repo, without its projects, domains or secrets.
+</Aside>
+
+## How the work was organised
+
+- **Rules in `CLAUDE.md`**, each with the incident that caused it. By the last day there were 17; anvil has 18.
+- **Queues in markdown**: `HUMAN.md` for steps only the owner can do (with exact commands), and, during the
+  migration, queues for a second Claude session working in parallel (each task separated by `---` with a `status:`
+  field). The owner's correction on night one: the queues hold **only what the agent can't do itself**.
+- **Subagents** for independent work: one per repo for package updates, two for the autopilot (the image, and the
+  pager's changes) working against an interface document, and "side agents" reviewing designs. Several important
+  catches came from those reviews: backups of the vault on the same machine, an AppRole that never expires, a
+  guard that is a pattern list rather than a sandbox, a possible false "fixed", secrets that exist only in chat.
+- **The permission check as a co-reviewer**: it blocked risky actions (applies on night one, nameserver changes,
+  bulk deletes, production reads during an audit) and the agent stopped and asked instead of working around it.
+- **Verification habits**: test on the box with the origin-pull certificate before DNS; verify through a Cloudflare
+  IP; prove where a request lands; measure instead of guessing; restore-test backups; read the transcript.
+
+## Numbers
+
+| | |
+|---|---|
+| Projects moved | ~21, from one old server and three small ones |
+| Sites cut over on day 1 | 12, about two hours after the server existed |
+| RAM on 8 GB | 0.9 GB free before the database merge → 2.3 GB after; ~1.5 GB free with monitoring on day 8 |
+| Databases | 11 MariaDB instances (38 MB of data, ~2 GB of RAM) → 1 (~224–300 MB) |
+| Pods / workloads | ~65 pods, 62 Deployments/StatefulSets |
+| Probes | 28 URLs every 30 s; 18 alert rules by the last day |
+| Backups | 15 files a night; daily 30 days, monthly 365 days |
+| Zero-downtime deploy | 9.6 s overlap; 453 + 219 requests, 0 errors |
+| Autopilot tests | fixed in 2 min 18 s (13 turns); gave up correctly in 76 s (6 turns) |
+| Calls caused by the operator's own mistakes | 3, all on one night |
+
+## What's next
+
+anvil itself: the bootstrap tested end to end on a throwaway server, the autopilot's credentials narrowed (its own
+SSH user or a Kubernetes ServiceAccount; no Docker socket; a narrower vault path), auto-commit and post-mortem scripts,
+and a sync skill to carry new features from the original platform to anvil.

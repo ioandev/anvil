@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""Move one project's database off atlas to its own MariaDB (on a node pool) with a live sync and a brief cutoff,
+and back again. docs: Operations → Scale a site out.
+
+  scripts/move-db <ns> status       where it stands: phase, replication, lag, positions
+  scripts/move-db <ns> use-alias    once, ahead of time: the app reaches its database through the Service <ns>-db (a DNS
+                                    alias of atlas), so a cutover flips the alias instead of restarting the app
+  scripts/move-db <ns> prepare      deploy <ns>-mariadb (on the project's pool), its secrets and users; read-only, empty
+  scripts/move-db <ns> seed         consistent copy from atlas while the site runs (no lock), with its exact position
+  scripts/move-db <ns> follow       live sync from that position: every change on atlas applied a moment later
+  scripts/move-db <ns> cutover      THE BRIEF CUTOFF: API answers 503, atlas login locked, final sync to the exact
+                                    last change, the new MariaDB promoted, the app pointed at it, API reopened
+  scripts/move-db <ns> back-follow  atlas follows the new MariaDB (only this database), from the promotion point
+  scripts/move-db <ns> back         the brief cutoff the other way: the app returns to atlas
+  scripts/move-db <ns> volumes-out  move the app's local volumes (move.volumes) to the pool: copy, switch the
+                                    deployment to the copy (rolling, no downtime), copy again what changed meanwhile
+  scripts/move-db <ns> volumes-back the same back to the original volumes on the server
+  scripts/move-db <ns> remove       delete <ns>-mariadb and its volume (refused while it is the primary)
+  scripts/move-db <ns> failover-to-atlas   EMERGENCY: the new server died while atlas was following it: promote atlas
+                                    without it (run back-follow right after every cutover so this is always possible)
+
+Settings: the project's `move:` in sites.yaml (pool, uid, storage, buffer_pool, memory, workloads, maintenance).
+Passwords: anvil.env (<NS>_RW/_RO/_REPL_PASSWORD, <NS>_DB_ROOT_PASSWORD; scripts/anvil-secrets init makes them for every
+project with `move:`); they travel only on stdin, never on disk or in a command line.
+
+Only the project's database is in atlas's binary log (--binlog-do-db): the sync never carries other projects' data.
+
+Overrides for the throwaway tests (scripts/move-db-test): MOVE_TARGET_NS, MOVE_NAME, MOVE_DB, MOVE_POOL (empty = no
+pool), MOVE_SOURCE_POD (ns/pod), MOVE_SOURCE_HOST, MOVE_APP_SECRET, MOVE_WORKLOADS (comma list), MOVE_MAINT_SERVICE
+(empty = no API switch), MOVE_NO_SITES=1 (don't edit sites.yaml), MOVE_ROOT_PW/MOVE_REPL_PW/MOVE_RW_PW/MOVE_RO_PW.
+"""
+import hashlib, json, os, pathlib, re, subprocess, sys, time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+os.chdir(ROOT)
+sys.path.insert(0, str(ROOT / "scripts"))
+import anvil_env  # noqa: E402  (scripts/node.sh reads the server's address from anvil.env itself)
+import sites as sites_lib  # noqa: E402
+TPL = ROOT / "scripts/templates/move-db-mariadb.yaml.tpl"
+MAINT_TPL = ROOT / "scripts/templates/move-db-maintenance.yaml.tpl"
+BACKUP_TPL = ROOT / "scripts/templates/move-db-backup.yaml.tpl"
+
+
+def die(msg):
+    print(f"move-db: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def say(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def kc(*args, input=None, check=True):
+    r = subprocess.run(["scripts/node.sh", "kubectl", *args], input=input, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"kubectl {' '.join(args[:4])}…: {r.stderr.strip()[:400]}")
+    return r
+
+
+def env_file(path):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return {}
+    return dict(l.split("=", 1) for l in p.read_text().splitlines() if "=" in l and not l.startswith("#"))
+
+
+# --------------------------------------------------------------------------------------------------- settings
+
+def settings(ns):
+    site = sites_lib.namespaces().get(ns)
+    mv = (site or {}).get("move") or {}
+    if not mv and not os.environ.get("MOVE_TARGET_NS"):
+        die(f"{ns} has no `move:` in sites.yaml")
+    e = os.environ.get
+    atlas = app = anvil_env.load()
+    N = ns.upper().replace("-", "_")
+    atlas_manifest = sites_lib.manifest("atlas")   # ${ANVIL_*} expanded
+    c = {
+        "ns": ns,
+        "target_ns": e("MOVE_TARGET_NS", ns),
+        "name": e("MOVE_NAME", f"{ns}-mariadb"),
+        "db": e("MOVE_DB", (site or {}).get("db", ns)),
+        "pool": e("MOVE_POOL", mv.get("pool", "")),
+        "uid": str(mv.get("uid", e("MOVE_UID", ""))),
+        "storage": e("MOVE_STORAGE") or mv.get("storage", "10Gi"),
+        "buffer_pool": e("MOVE_BUFFER_POOL") or mv.get("buffer_pool", "256M"),
+        "memory": e("MOVE_MEMORY") or mv.get("memory", "512Mi"),
+        "source_pod": e("MOVE_SOURCE_POD", "atlas/atlas-mariadb-0"),
+        "source_host": e("MOVE_SOURCE_HOST", "atlas-mariadb.atlas"),
+        "app_secret": e("MOVE_APP_SECRET", "atlas-db"),
+        "alias": e("MOVE_ALIAS", mv.get("alias", f"{ns}-db")),
+        "workloads": [w for w in e("MOVE_WORKLOADS", ",".join(mv.get("workloads", []))).split(",") if w],
+        "maint_service": e("MOVE_MAINT_SERVICE", (mv.get("maintenance") or {}).get("service", "")),
+        "maint_uid": str((mv.get("maintenance") or {}).get("uid", e("MOVE_MAINT_UID", ""))),
+        "no_sites": bool(e("MOVE_NO_SITES")),
+        "no_backup": bool(e("MOVE_NO_BACKUP")),
+        "backup_uid": str(mv.get("backup_uid", e("MOVE_BACKUP_UID", ""))),
+        "backup_pw": atlas.get("ATLAS_BACKUP_PASSWORD", ""),
+        "monitor_pw": atlas.get("ATLAS_MONITOR_PASSWORD", ""),
+        "backup_image": re.search(r"image:\s*(\S*/anvil-backup:\S+)", atlas_manifest).group(1),
+        # Volumes that move with the app (local volumes pin a pod to their node): [{deployment, container?, claim,
+        # size, uid}], from sites.yaml move.volumes or MOVE_VOLUMES (JSON) in tests.
+        "volumes": json.loads(e("MOVE_VOLUMES")) if e("MOVE_VOLUMES") else mv.get("volumes", []),
+        "root_pw": e("MOVE_ROOT_PW") or app.get(f"{N}_DB_ROOT_PASSWORD", ""),
+        "repl_pw": e("MOVE_REPL_PW") or atlas.get(f"{N}_REPL_PASSWORD", ""),
+        "rw_pw": e("MOVE_RW_PW") or atlas.get(f"{N}_RW_PASSWORD", ""),
+        "ro_pw": e("MOVE_RO_PW") or atlas.get(f"{N}_RO_PASSWORD", ""),
+        "image": re.search(r"image:\s*(mariadb:\S+)", atlas_manifest).group(1),
+    }
+    for k in ("uid", "root_pw", "repl_pw", "rw_pw", "ro_pw"):
+        if not c[k]:
+            die(f"missing setting {k} for {ns}")
+    c["target_pod"] = f"{c['target_ns']}/{c['name']}-0"
+    c["target_host"] = f"{c['name']}.{c['target_ns']}"
+    u = ns.replace("-", "_")   # database user names: anvil_demo_rw for namespace anvil-demo
+    c["rw"], c["ro"], c["repl"] = f"{u}_rw", f"{u}_ro", f"{u}_repl"
+    return c
+
+
+# --------------------------------------------------------------------------------------------------- SQL
+
+def sql(pod, text, check=True):
+    """Run SQL as root inside a MariaDB pod (its own $MARIADB_ROOT_PASSWORD); returns rows (tab-separated)."""
+    ns, name = pod.split("/")
+    r = kc("-n", ns, "exec", "-i", name, "-c", "mariadb", "--", "sh", "-c",
+           'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -N -B', input="SET SESSION sql_log_bin = 0;\n" + text,
+           check=False)
+    if check and r.returncode != 0:
+        die(f"SQL on {pod} failed: {r.stderr.strip()[:500]}")
+    return [l.split("\t") for l in r.stdout.splitlines() if l.strip()]
+
+
+def one(pod, text):
+    rows = sql(pod, text)
+    return rows[0][0] if rows and rows[0] else ""
+
+
+def q(s):
+    return "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def slave_status(pod, conn=""):
+    ns, name = pod.split("/")
+    r = kc("-n", ns, "exec", "-i", name, "-c", "mariadb", "--", "sh", "-c",
+           'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" -E', input=f"SHOW SLAVE {q(conn) if conn else ''} STATUS;",
+           check=False)
+    st = {}
+    for l in r.stdout.splitlines():
+        if ":" in l:
+            k, v = l.split(":", 1)
+            st[k.strip()] = v.strip()
+    return st
+
+
+def schema_hash(pod, db):
+    rows = sql(pod, f"""SELECT table_name, column_name, ordinal_position, column_type, is_nullable,
+        IFNULL(column_default,'∅'), extra FROM information_schema.columns WHERE table_schema = {q(db)}
+        ORDER BY table_name, ordinal_position;
+        SELECT CONCAT('idx:', table_name, ':', index_name, ':', seq_in_index, ':', column_name) FROM
+        information_schema.statistics WHERE table_schema = {q(db)} ORDER BY 1;""")
+    return hashlib.sha256("\n".join("\t".join(r) for r in rows).encode()).hexdigest()[:16], len(rows)
+
+
+# --------------------------------------------------------------------------------------------------- state
+
+def state(c):
+    r = kc("-n", c["target_ns"], "get", "configmap", f"{c['name']}-move", "-o", "json", check=False)
+    return json.loads(r.stdout)["data"] if r.returncode == 0 else {"phase": "none"}
+
+
+def set_state(c, **kv):
+    d = state(c)
+    d.update({k: str(v) for k, v in kv.items()})
+    d["updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    kc("-n", c["target_ns"], "apply", "-f", "-", input=json.dumps({
+        "apiVersion": "v1", "kind": "ConfigMap",
+        "metadata": {"name": f"{c['name']}-move", "namespace": c["target_ns"],
+                     "labels": {"app.kubernetes.io/part-of": c["ns"], "app.kubernetes.io/managed-by": "anvil",
+                                "anvil/tier": "app"}},
+        "data": d}))
+
+
+def need(c, *phases):
+    p = state(c)["phase"]
+    if p not in phases:
+        die(f"phase is '{p}'; this step needs {' or '.join(phases)} (scripts/move-db {c['ns']} status)")
+
+
+# --------------------------------------------------------------------------------------------------- steps
+
+def render(path, values):
+    t = path.read_text()
+    for k, v in values.items():
+        t = t.replace("${" + k + "}", v)
+    left = re.findall(r"\$\{[A-Z_]+\}", t)
+    if left:
+        die(f"{path.name}: unfilled {sorted(set(left))}")
+    return t
+
+
+def placement(pool, indent=6):
+    if not pool:
+        return ""
+    p = " " * indent
+    return (f"{p}nodeSelector: {{ anvil/pool: {pool} }}\n"
+            f"{p}tolerations: [{{ key: anvil/dedicated, operator: Equal, value: {pool}, effect: NoSchedule }}]")
+
+
+def cmd_prepare(c):
+    if state(c)["phase"] not in ("none", "prepared"):
+        die(f"already {state(c)['phase']}")
+    if c["pool"]:
+        r = kc("get", "nodes", "-l", f"anvil/pool={c['pool']}", "-o", "name")
+        if not r.stdout.strip():
+            die(f"no node in pool {c['pool']}: scripts/pool up {c['pool']} first")
+    kc("get", "namespace", c["target_ns"])
+    kc("-n", c["target_ns"], "apply", "-f", "-", input=json.dumps({
+        "apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+        "metadata": {"name": f"{c['name']}-secrets", "namespace": c["target_ns"],
+                     "labels": {"app.kubernetes.io/part-of": c["ns"], "app.kubernetes.io/managed-by": "anvil"}},
+        "stringData": {"MARIADB_ROOT_PASSWORD": c["root_pw"], "REPL_PASSWORD": c["repl_pw"]}}))
+    mem = c["memory"]
+    kc("apply", "-f", "-", input=render(TPL, {
+        "NS": c["target_ns"], "NAME": c["name"], "PART_OF": c["ns"], "POOL": c["pool"] or "(none)",
+        "PLACEMENT": placement(c["pool"]), "UID": c["uid"], "IMAGE": c["image"], "BUFFER_POOL": c["buffer_pool"],
+        "SERVER_ID": str(2 + (int(hashlib.sha256(c["name"].encode()).hexdigest(), 16) % 1000)),
+        "DOMAIN_ID": "2", "DB": c["db"], "SOURCE_HOST": c["source_host"], "REPL_USER": c["repl"],
+        "MEMORY_REQUEST": mem, "MEMORY_LIMIT": mem, "STORAGE": c["storage"]}))
+    say(f"waiting for {c['target_pod']} to be ready")
+    kc("-n", c["target_ns"], "rollout", "status", f"statefulset/{c['name']}", "--timeout=600s")
+    for _ in range(60):
+        if kc("-n", c["target_ns"], "get", "pod", f"{c['name']}-0", "-o",
+              "jsonpath={.status.containerStatuses[0].ready}", check=False).stdout == "true":
+            break
+        time.sleep(3)
+    rwp = ("SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, INDEX, REFERENCES, CREATE TEMPORARY TABLES, "
+           "LOCK TABLES, EXECUTE, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, ALTER ROUTINE, TRIGGER, EVENT")
+    db = c["db"]
+    sql(c["target_pod"], f"""
+        CREATE USER IF NOT EXISTS {q(c['rw'])}@'%' IDENTIFIED BY {q(c['rw_pw'])}; ALTER USER {q(c['rw'])}@'%' IDENTIFIED BY {q(c['rw_pw'])};
+        GRANT {rwp} ON `{db}`.* TO {q(c['rw'])}@'%';
+        CREATE USER IF NOT EXISTS {q(c['ro'])}@'%' IDENTIFIED BY {q(c['ro_pw'])}; ALTER USER {q(c['ro'])}@'%' IDENTIFIED BY {q(c['ro_pw'])};
+        GRANT SELECT, SHOW VIEW ON `{db}`.* TO {q(c['ro'])}@'%';
+        CREATE USER IF NOT EXISTS {q(c['repl'])}@'%' IDENTIFIED BY {q(c['repl_pw'])}; ALTER USER {q(c['repl'])}@'%' IDENTIFIED BY {q(c['repl_pw'])};
+        GRANT REPLICATION SLAVE, BINLOG MONITOR ON *.* TO {q(c['repl'])}@'%';
+        GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES, SHOW CREATE ROUTINE ON `{db}`.* TO {q(c['repl'])}@'%';
+        FLUSH PRIVILEGES;
+        RESET MASTER;""")
+    if c["monitor_pw"]:   # the replication alerts read its status as atlas_monitor (status only, no data)
+        sql(c["target_pod"], f"""CREATE USER IF NOT EXISTS 'atlas_monitor'@'%' IDENTIFIED BY {q(c['monitor_pw'])} WITH MAX_USER_CONNECTIONS 3;
+            ALTER USER 'atlas_monitor'@'%' IDENTIFIED BY {q(c['monitor_pw'])} WITH MAX_USER_CONNECTIONS 3;
+            GRANT PROCESS, BINLOG MONITOR, SLAVE MONITOR ON *.* TO 'atlas_monitor'@'%';""")
+    if not c["no_backup"]:
+        prepare_backup(c)
+    set_state(c, phase="prepared", db=c["db"], source_host=c["source_host"], source_pod=c["source_pod"])
+    say(f"prepared: {c['target_host']} (read-only, empty). Next: scripts/move-db {c['ns']} seed")
+
+
+def cmd_seed(c):
+    need(c, "prepared")
+    if one(c["target_pod"], f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = {q(c['db'])};") != "0":
+        die(f"{c['db']} on the target is not empty: refusing to overwrite it")
+    size = one(c["source_pod"], f"SELECT ROUND(SUM(data_length+index_length)/1048576) FROM information_schema.tables WHERE table_schema = {q(c['db'])};")
+    say(f"seeding {c['db']} ({size} MB on the source) from {c['source_host']}: the site keeps running")
+    # Inside the target pod, in the background (a 20 GB copy outlives any kubectl session). --single-transaction:
+    # a consistent snapshot without locking InnoDB tables; --gtid --master-data=1: the dump ends by setting the
+    # target's gtid_slave_pos to the exact position of that snapshot, which `follow` starts from.
+    job = ('rm -f /work/seed.rc; (set -o pipefail; mariadb-dump -h "$SOURCE_HOST" -u "$REPL_USER" -p"$REPL_PASSWORD" '
+           '--single-transaction --quick --gtid --master-data=1 --routines --triggers --events '
+           f'--databases {c["db"]} | (echo "SET SESSION sql_log_bin = 0;"; cat) | mariadb -uroot -p"$MARIADB_ROOT_PASSWORD"; '
+           'echo $? > /work/seed.rc) '
+           '> /work/seed.log 2>&1 &')
+    ns, name = c["target_pod"].split("/")
+    kc("-n", ns, "exec", name, "-c", "mariadb", "--", "bash", "-c", job)
+    t0 = time.time()
+    while True:
+        time.sleep(5)
+        r = kc("-n", ns, "exec", name, "-c", "mariadb", "--", "sh", "-c",
+               'cat /work/seed.rc 2>/dev/null; echo; du -sm /var/lib/mysql/' + c["db"] + ' 2>/dev/null | cut -f1', check=False)
+        rc, mb = (r.stdout.split("\n") + ["", ""])[:2]
+        if rc.strip():
+            break
+        say(f"  copying… {mb.strip() or 0} MB on the target, {int(time.time() - t0)} s")
+    log = kc("-n", ns, "exec", name, "-c", "mariadb", "--", "cat", "/work/seed.log", check=False).stdout.strip()
+    if rc.strip() != "0":
+        die(f"seed failed (exit {rc.strip()}): {log[-800:]}")
+    pos = one(c["target_pod"], "SELECT @@gtid_slave_pos;")
+    set_state(c, phase="seeded", seed_gtid=pos, seed_seconds=int(time.time() - t0))
+    say(f"seeded in {int(time.time() - t0)} s at position {pos or '(empty)'}. Next: scripts/move-db {c['ns']} follow")
+
+
+def prepare_backup(c):
+    """The nightly off-site backup's login (atlas_backup, as on atlas: reads and dumps, changes nothing) and its secret
+    (atlas's server-backup secret, pointed at this server, uploading to its own folder mariadb-<ns>)."""
+    if not c["backup_pw"] or not c["backup_uid"]:
+        die("backup settings missing (ATLAS_BACKUP_PASSWORD, move.backup_uid): a moved database must have a backup")
+    db = c["db"]
+    sql(c["target_pod"], f"""CREATE USER IF NOT EXISTS 'atlas_backup'@'%' IDENTIFIED BY {q(c['backup_pw'])};
+        ALTER USER 'atlas_backup'@'%' IDENTIFIED BY {q(c['backup_pw'])};
+        GRANT SELECT, SHOW VIEW, TRIGGER, EVENT, LOCK TABLES, SHOW CREATE ROUTINE ON `{db}`.* TO 'atlas_backup'@'%';""")
+    src = json.loads(kc("-n", "atlas", "get", "secret", "server-backup", "-o", "json").stdout)["data"]
+    import base64
+    data = {k: base64.b64decode(v).decode() for k, v in src.items()}
+    data.update({"DB_HOST": c["target_host"], "DB_USER": "atlas_backup", "MYSQL_PWD": c["backup_pw"],
+                 "BACKUP_SOURCE": f"mariadb-{c['ns']}"})
+    kc("-n", c["ns"], "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+       "metadata": {"name": f"{c['name']}-backup", "namespace": c["ns"],
+                    "labels": {"app.kubernetes.io/part-of": c["ns"], "app.kubernetes.io/managed-by": "anvil"}},
+       "stringData": data}))
+    say(f"backup login and secret ready (uploads to daily/<date>/mariadb-{c['ns']}/ once moved)")
+
+
+def start_backup(c):
+    """At the cutover: the nightly backup CronJob for the new primary, and one run now, so the moved database is
+    backed up from its first hour (and we know the backup works) instead of from the next night."""
+    if c["no_backup"]:
+        say("NO BACKUP (MOVE_NO_BACKUP, throwaway test only)")
+        return
+    kc("apply", "-f", "-", input=render(BACKUP_TPL, {
+        "NS": c["ns"], "NAME": c["name"], "PART_OF": c["ns"], "UID": c["backup_uid"], "IMAGE": c["backup_image"],
+        "PLACEMENT": placement(c["pool"], 10)}))
+    job = f"{c['name']}-backup-{time.strftime('%Y%m%d%H%M')}"
+    kc("-n", c["ns"], "create", "job", job, f"--from=cronjob/{c['name']}-backup")
+    say(f"first off-site backup running ({job}); waiting for it")
+    r = kc("-n", c["ns"], "wait", "--for=condition=complete", f"job/{job}", "--timeout=3600s", check=False)
+    if r.returncode != 0:
+        print(kc("-n", c["ns"], "logs", f"job/{job}", "--tail=30", check=False).stdout)
+        die(f"THE FIRST BACKUP OF THE MOVED DATABASE FAILED ({job}): fix it now; the nightly job will retry at 03:50 UTC")
+    say("first off-site backup done; nightly at 03:50 UTC, watched by backup-watch and /backups")
+
+
+def stop_backup(c):
+    if c["no_backup"]:
+        return
+    kc("-n", c["ns"], "delete", "cronjob", f"{c['name']}-backup", "--ignore-not-found", check=False)
+    say(f"{c['name']}-backup removed: the database is back on atlas, whose nightly backup covers it again")
+
+
+def wait_running(pod, conn=""):
+    for _ in range(30):
+        st = slave_status(pod, conn)
+        if st.get("Slave_IO_Running") == "Yes" and st.get("Slave_SQL_Running") == "Yes":
+            return st
+        if st.get("Last_IO_Error") or st.get("Last_SQL_Error"):
+            die(f"replication error on {pod}: {st.get('Last_IO_Error') or st.get('Last_SQL_Error')}")
+        time.sleep(2)
+    die(f"replication on {pod} didn't start: {st}")
+
+
+def cmd_follow(c):
+    need(c, "seeded")
+    sql(c["target_pod"], f"""STOP SLAVE; CHANGE MASTER TO MASTER_HOST={q(c['source_host'])}, MASTER_PORT=3306,
+        MASTER_USER={q(c['repl'])}, MASTER_PASSWORD={q(c['repl_pw'])}, MASTER_USE_GTID=slave_pos, MASTER_CONNECT_RETRY=5;
+        START SLAVE;""")
+    st = wait_running(c["target_pod"])
+    set_state(c, phase="following")
+    say(f"following {c['source_host']}: {st.get('Seconds_Behind_Master')} s behind. Next (when ready): scripts/move-db {c['ns']} cutover")
+
+
+def cmd_status(c):
+    s = state(c)
+    print(f"phase: {s.get('phase')}   (updated {s.get('updated', '-')})")
+    for k in ("seed_gtid", "seed_seconds", "promote_gtid", "cutover_seconds", "back_seconds"):
+        if k in s:
+            print(f"  {k}: {s[k]}")
+    if kc("-n", c["target_ns"], "get", "pod", f"{c['name']}-0", check=False).returncode != 0:
+        print(f"target {c['target_pod']}: not deployed")
+        return
+    print(f"source {c['source_pod']}: binlog position {one(c['source_pod'], 'SELECT @@gtid_binlog_pos;') or '(empty)'}")
+    st = slave_status(c["target_pod"])
+    if st:
+        print(f"target follows source: IO {st.get('Slave_IO_Running')}, SQL {st.get('Slave_SQL_Running')}, "
+              f"{st.get('Seconds_Behind_Master')} s behind, applied up to {st.get('Gtid_IO_Pos')}"
+              + (f", ERROR {st.get('Last_IO_Error') or st.get('Last_SQL_Error')}" if st.get('Last_IO_Error') or st.get('Last_SQL_Error') else ""))
+    bst = slave_status(c["source_pod"], c["ns"])
+    if bst:
+        print(f"source follows target (back): IO {bst.get('Slave_IO_Running')}, SQL {bst.get('Slave_SQL_Running')}, "
+              f"{bst.get('Seconds_Behind_Master')} s behind")
+    print(f"target read_only: {one(c['target_pod'], 'SELECT @@read_only;')}")
+    for pod in (c["source_pod"], c["target_pod"]):
+        h, n = schema_hash(pod, c["db"])
+        print(f"schema {pod}: {h} ({n} rows)")
+
+
+# ----- the cutoff (both directions) ----------------------------------------------------------------------------
+
+def maint(c, on):
+    """Point the project's API Service at the maintenance responder (503 + Retry-After) or back at the app."""
+    svc = c["maint_service"]
+    if not svc:
+        return
+    sel = {"app": f"{svc}-maintenance"} if on else {"app": svc}
+    kc("-n", c["ns"], "patch", "service", svc, "--type", "merge", "-p", json.dumps({"spec": {"selector": sel}}))
+    say(f"API {'CLOSED (503)' if on else 'reopened'}: service {svc} -> {sel['app']}")
+
+
+def maint_ready(c):
+    svc = c["maint_service"]
+    if not svc:
+        return
+    if not c["maint_uid"]:
+        die("maintenance.uid missing in sites.yaml")
+    ports = json.loads(kc("-n", c["ns"], "get", "service", svc, "-o", "jsonpath={.spec.ports}").stdout)
+    kc("apply", "-f", "-", input=render(MAINT_TPL, {
+        "NS": c["ns"], "NAME": f"{svc}-maintenance", "PART_OF": c["ns"], "UID": c["maint_uid"],
+        "LISTEN": "\n".join(f"        listen {p['targetPort']};" for p in ports),
+        "PORTS": ", ".join(f"{{ containerPort: {p['targetPort']} }}" for p in ports),
+        "FIRST_PORT": str(ports[0]["targetPort"])}))
+    kc("-n", c["ns"], "rollout", "status", f"deploy/{svc}-maintenance", "--timeout=120s")
+
+
+def maint_remove(c):
+    if c["maint_service"]:
+        kc("-n", c["ns"], "delete", "deploy", f"{c['maint_service']}-maintenance", "--ignore-not-found", check=False)
+        kc("-n", c["ns"], "delete", "configmap", f"{c['maint_service']}-maintenance", "--ignore-not-found", check=False)
+
+
+def lock_and_drain(pod, user):
+    sql(pod, f"ALTER USER {q(user)}@'%' ACCOUNT LOCK;")
+    for _ in range(20):
+        ids = [r[0] for r in sql(pod, f"SELECT id FROM information_schema.processlist WHERE user = {q(user)};")]
+        if not ids:
+            return
+        sql(pod, "".join(f"KILL CONNECTION {i};" for i in ids), check=False)
+        time.sleep(0.5)
+    die(f"{user} still has connections on {pod}")
+
+
+def fqdn(host):
+    return host if host.endswith(".svc.cluster.local") else f"{host}.svc.cluster.local"
+
+
+def alias_exists(c):
+    return kc("-n", c["ns"], "get", "service", c["alias"], check=False).returncode == 0
+
+
+def point_app(c, host):
+    """Point the app at `host`: flip the alias (no restart: connections to the old host were ended, new ones resolve
+    the alias again within the DNS TTL of 5 s), or, without an alias, rewrite DB_HOST and restart the workloads."""
+    if alias_exists(c):
+        kc("-n", c["ns"], "patch", "service", c["alias"], "--type", "merge", "-p",
+           json.dumps({"spec": {"externalName": fqdn(host)}}))
+        say(f"alias {c['alias']} -> {host}; waiting 6 s for DNS (TTL 5 s)")
+        time.sleep(6)
+        return
+    kc("-n", c["ns"], "patch", "secret", c["app_secret"], "--type", "merge", "-p",
+       json.dumps({"stringData": {"DB_HOST": host}}))
+    for w in c["workloads"]:
+        kc("-n", c["ns"], "rollout", "restart", w)
+    for w in c["workloads"]:
+        kc("-n", c["ns"], "rollout", "status", w, "--timeout=300s")
+    say(f"app now uses {host} (restarted: {', '.join(c['workloads']) or 'nothing'})")
+
+
+def cmd_use_alias(c):
+    """Once, ahead of time (a normal rolling restart of the app, no downtime): the Service <ns>-db, an ExternalName
+    alias of the current database host, and the app's DB_HOST pointed at it (sites.yaml db_host, make-secrets)."""
+    cur = kc("-n", c["ns"], "get", "secret", c["app_secret"], "-o", "jsonpath={.data.DB_HOST}").stdout
+    import base64
+    cur = base64.b64decode(cur).decode() if cur else c["source_host"]
+    alias_host = f"{c['alias']}.{c['ns']}"
+    if cur == alias_host:
+        say(f"the app already uses {alias_host}")
+        return
+    if not alias_exists(c):
+        kc("-n", c["ns"], "apply", "-f", "-", input=json.dumps({
+            "apiVersion": "v1", "kind": "Service",
+            "metadata": {"name": c["alias"], "namespace": c["ns"],
+                         "labels": {"app.kubernetes.io/part-of": c["ns"], "app.kubernetes.io/managed-by": "anvil",
+                                    "anvil/tier": "app"},
+                         "annotations": {"anvil/owner": "scripts/move-db: the cutover flips externalName"}},
+            "spec": {"type": "ExternalName", "externalName": fqdn(cur)}}))
+        say(f"alias {c['alias']} -> {cur}")
+    if not c["no_sites"]:
+        set_sites_db_host(c["ns"], alias_host)
+        subprocess.run(["python3", "-I", "scripts/make-secrets.py"], check=True, capture_output=True)
+        say(f"sites.yaml db_host: {alias_host}; now deploy the app: scripts/node.sh deploy {c['ns']} (rolling restart)")
+    else:
+        kc("-n", c["ns"], "patch", "secret", c["app_secret"], "--type", "merge", "-p",
+           json.dumps({"stringData": {"DB_HOST": alias_host}}))
+        for w in c["workloads"]:
+            kc("-n", c["ns"], "rollout", "restart", w)
+            kc("-n", c["ns"], "rollout", "status", w, "--timeout=300s")
+        say(f"the app uses {alias_host}")
+
+
+def set_sites_db_host(ns, host):
+    """sites.yaml's `db_host:` (read by make-secrets.py): set to the alias by use-alias, so redeploys keep it."""
+    p = pathlib.Path("sites.yaml")
+    lines = p.read_text().splitlines(keepends=True)
+    out, i, done = [], 0, False
+    start = next((n for n, l in enumerate(lines) if re.match(rf"^  {re.escape(ns)}:\s*$", l)), None)
+    if start is None:
+        die(f"{ns} not found in sites.yaml")
+    end = next((n for n in range(start + 1, len(lines)) if re.match(r"^  \S", lines[n])), len(lines))
+    block = [l for l in lines[start + 1:end] if not l.startswith("    db_host:")]
+    if host:
+        db_at = next((n for n, l in enumerate(block) if l.startswith("    db:")), 0)
+        block.insert(db_at + 1, f"    db_host: {host}   # an alias: scripts/move-db flips it at a cutover (docs: Operations → Scale a site out)\n")
+    p.write_text("".join(lines[:start + 1] + block + lines[end:]))
+
+
+def switch(c, src, dst, src_conn, dst_conn, label):
+    """The brief cutoff: writes stop on src, dst catches up to src's exact last change, dst takes over."""
+    t0 = time.time()
+    st = slave_status(dst, dst_conn)
+    if st.get("Slave_IO_Running") != "Yes" or st.get("Slave_SQL_Running") != "Yes":
+        die(f"{dst} isn't following {src} (IO {st.get('Slave_IO_Running')}, SQL {st.get('Slave_SQL_Running')})")
+    lag = st.get("Seconds_Behind_Master")
+    if lag in (None, "NULL") or int(lag) > 1:
+        die(f"{dst} is {lag} s behind: wait until it is at most 1 s")
+    h1, h2 = schema_hash(src, c["db"]), schema_hash(dst, c["db"])
+    if h1 != h2:
+        die(f"schemas differ ({h1} vs {h2}): a change was made without `USE {c['db']}`? Fix before switching")
+    maint_ready(c)
+    say(f"checks passed (lag {lag} s, schema {h1[0]}). CUTOFF STARTS")
+    t_cut = time.time()
+    maint(c, True)
+    try:
+        # One round trip: lock the app's login, end every connection it has, read the exact last position.
+        rows = sql(src, f"ALTER USER {q(c['rw'])}@'%' ACCOUNT LOCK; KILL CONNECTION USER {q(c['rw'])}; "
+                        f"SELECT @@gtid_binlog_pos; SELECT COUNT(*) FROM information_schema.processlist WHERE user = {q(c['rw'])};")
+        pos, left = (rows[0][0] if rows and rows[0] else ""), (rows[1][0] if len(rows) > 1 else "0")
+        if left != "0":
+            lock_and_drain(src, c["rw"])
+            pos = one(src, "SELECT @@gtid_binlog_pos;")
+        say(f"writes stopped on {src}; final sync up to {pos or '(empty)'}")
+        # One round trip: wait for that exact position, then promote (stop following, writable, login open).
+        stop = f"STOP SLAVE {q(dst_conn)}; RESET SLAVE {q(dst_conn)} ALL;" if dst_conn else "STOP SLAVE; RESET SLAVE ALL;"
+        rw_on = "SET GLOBAL read_only = OFF;" if dst == c["target_pod"] else ""
+        rows = sql(dst, (f"SELECT MASTER_GTID_WAIT({q(pos)}, 60);" if pos else "SELECT 0;") + "\n"
+                        f"SELECT IF(MASTER_GTID_WAIT({q(pos or '')}, 0) = 0, 'synced', 'NOT SYNCED');" + "\n")
+        if not rows or rows[0][0] != "0" or rows[-1][0] != "synced":
+            raise RuntimeError(f"{dst} didn't reach {pos} within 60 s")
+    except (RuntimeError, SystemExit) as e:
+        say(f"ABORTING before the switch ({e}): reopening on {src}, nothing lost")
+        sql(src, f"ALTER USER {q(c['rw'])}@'%' ACCOUNT UNLOCK;")
+        maint(c, False)
+        die("cutover aborted")
+    # Past this point the destination is the truth.
+    promote = one(dst, f"{stop} {rw_on} ALTER USER {q(c['rw'])}@'%' ACCOUNT UNLOCK; SELECT @@gtid_binlog_pos;")
+    say(f"{dst} promoted (its position {promote or '(empty)'}); pointing the app at it")
+    point_app(c, c["target_host"] if dst == c["target_pod"] else c["source_host"])
+    maint(c, False)
+    took = time.time() - t_cut
+    say(f"{label} done: API closed for {took:.1f} s (whole step {time.time() - t0:.1f} s)")
+    return promote, took
+
+
+def cmd_cutover(c):
+    need(c, "following")
+    if not alias_exists(c) and not os.environ.get("MOVE_ALLOW_RESTART"):
+        die(f"no alias {c['alias']}: run scripts/move-db {c['ns']} use-alias first (or MOVE_ALLOW_RESTART=1: a longer cutoff)")
+    promote, took = switch(c, c["source_pod"], c["target_pod"], "", "", "cutover")
+    set_state(c, phase="moved", promote_gtid=promote, cutover_seconds=f"{took:.1f}")
+    maint_remove(c)
+    start_backup(c)
+    say(f"moved. The copy on atlas stays read-only (login locked) as the way back: scripts/move-db {c['ns']} back-follow, back")
+
+
+def cmd_back_follow(c):
+    need(c, "moved")
+    s = state(c)
+    conn = c["ns"]
+    # atlas follows the target with a named connection limited to this database, from the promotion point: atlas's
+    # copy is exactly the state at the cutover (its login has been locked since), so no new copy is needed.
+    own = one(c["source_pod"], "SELECT @@gtid_binlog_pos;")
+    pos = ",".join(x for x in (own, s.get("promote_gtid", "")) if x)
+    sql(c["source_pod"], f"STOP SLAVE {q(conn)};", check=False)   # errors if the connection doesn't exist yet
+    sql(c["source_pod"], f"""SET GLOBAL gtid_slave_pos = {q(pos)};
+        CHANGE MASTER {q(conn)} TO MASTER_HOST={q(c['target_host'])}, MASTER_PORT=3306, MASTER_USER={q(c['repl'])},
+        MASTER_PASSWORD={q(c['repl_pw'])}, MASTER_USE_GTID=slave_pos, MASTER_CONNECT_RETRY=5, DO_DOMAIN_IDS=(2);
+        SET GLOBAL `{conn}`.replicate_do_db = {q(c['db'])};
+        START SLAVE {q(conn)};""")
+    st = wait_running(c["source_pod"], conn)
+    set_state(c, phase="following-back")
+    say(f"atlas follows {c['target_host']}: {st.get('Seconds_Behind_Master')} s behind. Next: scripts/move-db {c['ns']} back")
+
+
+def cmd_back(c):
+    need(c, "following-back")
+    _, took = switch(c, c["target_pod"], c["source_pod"], c["ns"], c["ns"], "back")
+    sql(c["target_pod"], f"SET GLOBAL read_only = ON; ALTER USER {q(c['rw'])}@'%' ACCOUNT LOCK;")
+    set_state(c, phase="back", back_seconds=f"{took:.1f}")
+    maint_remove(c)
+    stop_backup(c)
+    say(f"back on atlas. {c['name']} is now an idle read-only copy: scripts/move-db {c['ns']} remove")
+
+
+def cmd_failover_to_atlas(c):
+    """EMERGENCY ONLY: the new server is gone (its node died) while atlas was following it (phase following-back).
+    Promote atlas without talking to the new server: stop following, open the app's login, flip the alias. Changes the
+    new server made in its last moments may be missing (atlas was a fraction of a second behind)."""
+    need(c, "following-back")
+    st = slave_status(c["source_pod"], c["ns"])
+    say(f"atlas was following: {st.get('Seconds_Behind_Master')} s behind, applied up to {st.get('Gtid_IO_Pos')}")
+    sql(c["source_pod"], f"STOP SLAVE {q(c['ns'])}; RESET SLAVE {q(c['ns'])} ALL; ALTER USER {q(c['rw'])}@'%' ACCOUNT UNLOCK;")
+    point_app(c, c["source_host"])
+    stop_backup(c)
+    set_state(c, phase="back", back_seconds="failover")
+    say("FAILED OVER to atlas. When the new server is reachable again: scripts/move-db "
+        f"{c['ns']} remove (its data is older than atlas's now), then prepare/seed again for a new move")
+
+
+# ----- volumes that move with the app -------------------------------------------------------------------------
+
+def helper(c, name, claim, uid, pool):
+    """A shell pod mounting one volume (the app images have no shell), for the copies."""
+    spec = {"enableServiceLinks": False, "restartPolicy": "Never", "terminationGracePeriodSeconds": 1,
+            "securityContext": {"runAsUser": int(uid), "runAsGroup": int(uid), "fsGroup": int(uid)},
+            "containers": [{"name": "sh", "image": "busybox:1.37", "command": ["sleep", "3600"],
+                            "resources": {"limits": {"memory": "64Mi"}},
+                            "volumeMounts": [{"name": "v", "mountPath": "/v"}]}],
+            "volumes": [{"name": "v", "persistentVolumeClaim": {"claimName": claim}}]}
+    if pool:
+        spec["nodeSelector"] = {"anvil/pool": pool}
+        spec["tolerations"] = [{"key": "anvil/dedicated", "operator": "Equal", "value": pool, "effect": "NoSchedule"}]
+    kc("-n", c["ns"], "delete", "pod", name, "--ignore-not-found", "--wait=true", check=False)
+    kc("-n", c["ns"], "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "Pod",
+       "metadata": {"name": name, "namespace": c["ns"], "labels": {"app.kubernetes.io/part-of": c["ns"],
+                    "app.kubernetes.io/managed-by": "anvil", "app.kubernetes.io/component": "job"}}, "spec": spec}))
+    kc("-n", c["ns"], "wait", "--for=condition=ready", f"pod/{name}", "--timeout=300s")
+
+
+def copy_volume(c, src_pod, dst_pod):
+    """tar from one helper to the other, streamed through kubectl (no file in between); returns the file count."""
+    ns = c["ns"]
+    src = subprocess.Popen(["scripts/node.sh", "kubectl", "-n", ns, "exec", src_pod, "--", "tar", "cf", "-", "-C", "/v", "."],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    dst = subprocess.run(["scripts/node.sh", "kubectl", "-n", ns, "exec", "-i", dst_pod, "--", "tar", "xf", "-", "-C", "/v"],
+                         stdin=src.stdout, capture_output=True)
+    src.stdout.close()
+    src.wait()
+    if src.returncode != 0 or dst.returncode != 0:
+        die(f"copy {src_pod} -> {dst_pod} failed: {src.stderr.read().decode()[-300:]} {dst.stderr.decode()[-300:]}")
+    n = kc("-n", ns, "exec", dst_pod, "--", "sh", "-c", "find /v -type f | wc -l").stdout.strip()
+    return n
+
+
+def switch_volumes(c, outwards):
+    if not c["volumes"]:
+        say("no move.volumes: nothing to do")
+        return
+    for v in c["volumes"]:
+        old, new = v["claim"], f"{v['claim']}-pool"
+        src_claim, dst_claim = (old, new) if outwards else (new, old)
+        if outwards:
+            kc("-n", c["ns"], "apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+               "metadata": {"name": new, "namespace": c["ns"], "labels": {"app.kubernetes.io/part-of": c["ns"],
+                            "app.kubernetes.io/managed-by": "anvil", "anvil/tier": "app"},
+                            "annotations": {"anvil/owner": f"scripts/move-db: {old} while moved"}},
+               "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "local-path",
+                        "resources": {"requests": {"storage": v.get("size", "1Gi")}}}}))
+        s_pod, d_pod = f"{c['ns']}-volcopy-src", f"{c['ns']}-volcopy-dst"
+        helper(c, s_pod, src_claim, v["uid"], None if outwards else c["pool"])
+        helper(c, d_pod, dst_claim, v["uid"], c["pool"] if outwards else None)
+        say(f"copying {src_claim} -> {dst_claim}: {copy_volume(c, s_pod, d_pod)} files")
+        # The deployment switches to the other volume: a rolling restart; the new volume's node decides where it runs.
+        dep = json.loads(kc("-n", c["ns"], "get", "deploy", v["deployment"], "-o", "json").stdout)
+        vols = dep["spec"]["template"]["spec"]["volumes"]
+        hit = [i for i, x in enumerate(vols) if (x.get("persistentVolumeClaim") or {}).get("claimName") == src_claim]
+        if not hit:
+            die(f"{v['deployment']} doesn't use {src_claim}")
+        patch = [{"op": "replace", "path": f"/spec/template/spec/volumes/{hit[0]}/persistentVolumeClaim/claimName",
+                  "value": dst_claim}]
+        kc("-n", c["ns"], "patch", "deploy", v["deployment"], "--type", "json", "-p", json.dumps(patch))
+        kc("-n", c["ns"], "rollout", "status", f"deploy/{v['deployment']}", "--timeout=600s")
+        node = kc("-n", c["ns"], "get", "pods", "-l", f"app={v['deployment']}", "-o",
+                  "jsonpath={.items[*].spec.nodeName}").stdout
+        # What the old pod wrote between the first copy and its end.
+        say(f"{v['deployment']} now uses {dst_claim} (on {node}); copying what changed meanwhile: "
+            f"{copy_volume(c, s_pod, d_pod)} files on the destination")
+        for pod in (s_pod, d_pod):
+            kc("-n", c["ns"], "delete", "pod", pod, "--ignore-not-found", "--wait=false", check=False)
+    set_state(c, volumes="pool" if outwards else "server")
+
+
+def cmd_volumes_out(c):
+    if c["pool"] and kc("get", "nodes", "-l", f"anvil/pool={c['pool']}", "-o", "name").stdout.strip() == "":
+        die(f"no node in pool {c['pool']}")
+    switch_volumes(c, True)
+
+
+def cmd_volumes_back(c):
+    if state(c).get("volumes") != "pool":
+        die("the volumes aren't on the pool")
+    switch_volumes(c, False)
+
+
+def cmd_remove(c):
+    p = state(c)["phase"]
+    if p in ("moved", "following-back"):
+        die(f"phase {p}: {c['name']} is the primary; move back first")
+    if state(c).get("volumes") == "pool":
+        die(f"the app's volumes are still on the pool: scripts/move-db {c['ns']} volumes-back first")
+    for k in (["statefulset", c["name"]], ["service", c["name"]], ["secret", f"{c['name']}-secrets"],
+              ["configmap", f"{c['name']}-move"], ["pvc", f"data-{c['name']}-0"]):
+        kc("-n", c["target_ns"], "delete", *k, "--ignore-not-found", "--wait=false", check=False)
+    for v in c["volumes"]:
+        kc("-n", c["ns"], "delete", "pvc", f"{v['claim']}-pool", "--ignore-not-found", "--wait=false", check=False)
+    kc("-n", c["ns"], "delete", "secret", f"{c['name']}-backup", "--ignore-not-found", check=False)
+    kc("-n", c["ns"], "delete", "cronjob", f"{c['name']}-backup", "--ignore-not-found", check=False)
+    say(f"removed {c['name']} and its volume")
+
+
+def main():
+    if len(sys.argv) != 3:
+        print(__doc__)
+        sys.exit(2)
+    c = settings(sys.argv[1])
+    cmds = {"status": cmd_status, "use-alias": cmd_use_alias, "prepare": cmd_prepare, "seed": cmd_seed, "follow": cmd_follow,
+            "cutover": cmd_cutover, "back-follow": cmd_back_follow, "back": cmd_back, "remove": cmd_remove,
+            "failover-to-atlas": cmd_failover_to_atlas, "volumes-out": cmd_volumes_out, "volumes-back": cmd_volumes_back}
+    if sys.argv[2] not in cmds:
+        die(f"unknown step {sys.argv[2]}")
+    cmds[sys.argv[2]](c)
+
+
+if __name__ == "__main__":
+    main()

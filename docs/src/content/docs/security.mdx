@@ -1,0 +1,64 @@
+---
+title: Security
+description: The security posture in layers - edge, network, cluster, data, secrets, monitoring, automation - and what is still open.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+anvil assumes one owner, a handful of trusted projects, and attackers on the internet. Each layer is meant to hold
+even if the one in front of it fails.
+
+## Layers
+
+| Layer | Control | Where |
+|---|---|---|
+| Edge | Cloudflare proxy for every public host; DDoS/WAF at the edge; no IPv6 on the origin | [Edge](/components/edge/) |
+| Network | security group default **drop**; 80/443 only from Cloudflare's IPv4 ranges; SSH on a non-standard port, key-only | `infra/instance.tf` |
+| TLS to origin | Traefik requires a client certificate signed by **your** CA (other Cloudflare customers can't connect); TLS ≥ 1.2 | `infra/manifests/origin-pull.yaml.tpl` |
+| Certificates | Origin CA from your laptop; **no Cloudflare token and no ACME on the server** | `platform/origin-ca` |
+| Internal UIs | Grafana, Prometheus, Alertmanager, Dozzle only via Tailscale (`tailscale serve`), never an Ingress or DNS record | Butane |
+| Kubernetes API | not exposed; `kubectl` runs on the node over SSH | `scripts/node.sh` |
+| Workloads | own namespace and **unique numeric UID/GID** per container; `enableServiceLinks: false`; project-prefixed Service names | [App rules](/reference/app-rules/) |
+| Read-only tools | Dozzle's RBAC is get/list/watch (no exec, no delete, no Secrets); health-watch can only `list` pods, jobs and CronJobs, backup-watch only `get`/`list` CronJobs; the database health check logs in as a user that can't read anything | manifests |
+| Database | root only from inside the pod; per project `_rw` limited to its database and `_ro` read-only; a login-only `health` user for checks | [Data](/components/data/) |
+| Backups | uploaded with a key that can write but not list, read or delete: the server can't erase its history | [Data](/components/data/#the-key-can-only-write) |
+| Secrets | encrypted in git (SOPS + age); plaintext gitignored; pre-commit hook refuses leaks and stale twins | [Secrets](/components/secrets/) |
+| Status endpoints | a code on every GET, a token on every POST, bare 500 otherwise, per-IP rate limit (60/min, burst 100); webhookd logs at info so the code never lands in logs | [Status webhooks](/components/status-webhooks/) |
+| Client IP | apps trust exactly 2 proxy hops or `CF-Connecting-IP`; never the left-most `X-Forwarded-For` | [rule 7](/reference/app-rules/#7-client-ip) |
+| Automation | the autopilot's guard hook, read-only deploy key, run limits, scrubbed records | [Autopilot](/components/autopilot/) |
+
+## SSH stays open to the world, on purpose
+
+SSH (key-only, high port) is reachable from anywhere so access survives losing Tailscale. Restricting it to the
+tailnet is one variable (`ssh_allowed_cidrs`), at the price of being locked out when Tailscale is down.
+
+## What Claude Code may do
+
+- **Allowed by the owner in writing** (`CLAUDE.md`): `terraform plan` and `apply` after reading the plan.
+- **Never without asking**: destroy, or replace the server or its IP.
+- **Blocked by the permission check** (and then written into `HUMAN.md` for the owner): bulk deletes in production,
+  some DNS changes, using someone else's credentials, unvetted downloads.
+- The **autopilot** has a much narrower allowlist: [what it may do](/components/autopilot/#what-it-may-do-live-only-actions).
+
+## Run an audit
+
+The `/security-audit` command walks through infrastructure, cluster, every app's deployment, the edge, secrets,
+monitoring, backups, the second machine and your laptop, and writes findings with severities. Re-run it after
+large changes.
+
+## Open items
+
+Honest list of what isn't done yet, in anvil and on the server it came from:
+
+| Item | Risk | Plan |
+|---|---|---|
+| **The autopilot can create a Job from a CronJob** (its re-run repair) | that Job may use a Secret the CronJob's namespace already uses: a prompt injection that defeats the guard could read one of those | the cluster refuses everything else (no Secrets, no exec, no SSH, no root, no age key, an admission policy on workload changes: `platform/autopilot-access`); a narrower re-run (only the CronJob's exact template) would need a small controller. |
+| **The automation's vault login is one file on the home machine** (the AppRole secret ID never expires) | whoever copies it can read what the AppRole can | secret-ID TTL or single use; bind the login to the Mac's address (needs `X-Forwarded-For` through `tailscale serve`: unverified); keep the file out of backups |
+| **The original server's vault still holds every app's `prod.env`** | a vault compromise exposes all apps there | anvil's vault holds only operator credentials by design; the original is to follow |
+| **FileVault vs unattended restart on a Mac** | either the disk is unencrypted, or the watchdog is down after an unplanned reboot | owner's decision ([Mac helpers](/components/mac-helpers/#the-boot-without-login-gap)) |
+| **File volumes not backed up off-site** (only the databases are) | data loss if the node's disk dies | add per-app file backups where needed |
+
+<Aside type="note">
+None of these are hidden: on the original platform they are tasks with exact steps in its `HUMAN.md`. The autopilot's access was
+narrowed in November 2026 (no SSH or root; see the autopilot page). anvil's own `HUMAN.md` collects the same kind of task.
+</Aside>

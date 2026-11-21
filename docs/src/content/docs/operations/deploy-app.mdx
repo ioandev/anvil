@@ -1,0 +1,91 @@
+---
+title: Deploy an app
+description: Build, tag and push an image, update the manifest, deploy one namespace, verify - and how to make it zero-downtime.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+A new **site** (domain, zone, DNS) is [Add a site](/operations/add-site/). This page ships a new version of an
+app that already exists, or adds a workload to an existing namespace.
+
+<Steps>
+
+1. **Check the disk** on your laptop before building (`df -h`); builds take ~2 GB each. A build that dies with "no
+   space left" can leave a half-written image: `podman rmi -f <id>`.
+
+2. **Build and push**, stopping on the first failure:
+
+   ```sh
+   set -euo pipefail
+   TAG=$(scripts/image-tag /path/to/app)        # e.g. 20261027-83f3c56
+   IMG=$ANVIL_REGISTRY/<app>:$TAG                  # from anvil.env
+   podman build -t "$IMG" /path/to/app
+   podman push "$IMG"
+   ```
+
+   [Image tags](/reference/image-tags/) are never reused or moved; no `:latest`.
+
+3. **Update `apps/<ns>/app.yaml`**: the `image:` and the `app.kubernetes.io/version` label. New secret keys go in
+   `apps/<ns>/prod.env`, then `make secrets-encrypt`.
+
+4. **Check the rules**: `python3 -I scripts/sites.py check` must report 0 errors (unique Service names, UIDs inside
+   the namespace's block, `enableServiceLinks: false`, probes, …).
+
+5. **Deploy** from a clean worktree of the commit:
+
+   ```sh
+   python3 -I scripts/make-secrets.py
+   scripts/node.sh deploy <ns>
+   ```
+
+   It applies the Secrets first, then the manifest, then restarts only workloads whose config changed
+   (`config changed: restarted <ns>/<name>`). Don't `rollout restart` by hand.
+
+6. **Verify** like a visitor and like the monitor:
+
+   ```sh
+   scripts/node.sh kubectl -n <ns> rollout status deploy/<name>
+   scripts/node.sh curl <host> /healthz              # through Traefik with the origin-pull cert
+   curl -s -o /dev/null -w '%{http_code}\n' "https://status.example.com/cluster?code=$STATUS_CODE"
+   ```
+
+   `/cluster` must be 200. Remember the alert rules ignore a changed workload for 10 minutes: if it's still broken
+   after that, you get called.
+
+</Steps>
+
+<Aside type="caution">
+`node.sh deploy` prints the second of two applies, which often says `unchanged` even when something changed. Check
+the live object (`kubectl get deploy <name> -o jsonpath='{.spec.template.spec.containers[0].image}'`).
+</Aside>
+
+## Zero-downtime deploys
+
+On the original server a real app (Next.js frontend + Spring Boot backend) deploys with **no failed request** (tested with
+~550 requests during rolling restarts). The recipe is plain Kubernetes:
+
+| Setting | Value | Why |
+|---|---|---|
+| strategy | `RollingUpdate`, `maxSurge: 1`, `maxUnavailable: 0` | the new pod starts beside the old one |
+| readiness probe | a **port check** (`tcpSocket`) by default (the template's), or a cheap readiness route with a generous timeout; never the full page with a 1 s timeout | traffic only once it's really ready, and a busy pod is never taken out of service (see [Lessons](/lessons/#capacity-and-load-tests)) |
+| `preStop` | Kubernetes' built-in `sleep: { seconds: 5 }`, not `exec sleep 5` | keeps serving while Traefik drops it from rotation (~1 s); minimal images have no `sleep` binary and the exec hook fails silently |
+| graceful shutdown | the framework's (`server.shutdown: graceful`) | finishes in-flight requests on SIGTERM |
+| `terminationGracePeriodSeconds` | 60 (backend), 30 (frontend) | covers preStop + shutdown |
+
+The old and new pods overlap for about **10 s** (at most ~15 s). That's safe only if:
+
+1. **Migrations work with the previous release still running** (expand/contract): add tables, nullable columns,
+   indexes; never drop or rename something the previous release uses in the same release. A release that can't
+   follow this is deployed with planned downtime (scale to 0 first).
+2. **Scheduled jobs tolerate two copies** for those seconds, e.g. claim rows with `SELECT … FOR UPDATE SKIP LOCKED`.
+3. **Sessions live in the database**, not in memory.
+
+Bots, cron jobs and queue workers are the exception: `strategy: Recreate`, one replica
+([rule 6](/reference/app-rules/#6-bots-cron-jobs-and-workers-are-singletons)). Two Discord gateway sessions on one
+token, or duplicate emails, are worse than a few seconds offline.
+
+## Before you test on production
+
+- Make sure nothing real can be sent by accident (an app's email outbox empty) and never create test accounts or
+  sign-ups on production.
+- Test workloads are named `zz-…` in a `zz-…` namespace and deleted within 10 minutes, or they page you.

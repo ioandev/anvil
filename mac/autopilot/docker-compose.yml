@@ -1,0 +1,85 @@
+# The autopilot on the Mac mini (source: /repos/autopilot (README there); the server's side: docs/autopilot-interfaces.md). It polls the server's
+# Alertmanager/Prometheus over the tailnet every 15 s; when an alert stays on it runs Claude Code headless to fix
+# it (live-only actions, enforced by its PreToolUse guard), then reports (post-mortem, email, records here and off-site; git is read-only).
+# Heartbeat: POST https://status.${ANVIL_DOMAIN}/autopilot_state; owner commands: https://status.${ANVIL_DOMAIN}/autopilot?code=…
+# No source here: the image is built on the Linux machine and loaded with `docker load` (README.md). No secrets
+# here either: everything comes from OpenBao with the AppRole file.
+services:
+  autopilot:
+    image: ${ANVIL_REGISTRY}/autopilot:${ANVIL_AUTOPILOT_TAG}   # loaded with `docker load`, never pulled
+    pull_policy: never
+    container_name: ${ANVIL_NAME}-autopilot
+    restart: unless-stopped
+    stop_grace_period: 30s          # the watcher kills a running run's process group and saves its state
+    environment:
+      ALERTMANAGER_URL: https://${ANVIL_TAILNET_HOST}:8443
+      PROMETHEUS_URL: https://${ANVIL_TAILNET_HOST}:9443
+      WEBHOOK_URL: https://status.${ANVIL_DOMAIN}
+      REPO_URL: "${ANVIL_REPO_URL}"   # this repo over SSH (a read-only deploy key in the vault); empty: runs work without a clone
+      # The heartbeat's X-Token: ops/autopilot first (once added there), else the webhook app's own.
+      WEBHOOK_TOKEN_REFS: ops/autopilot#WEBHOOK_TOKEN,ops/platform#WEBHOOK_TOKEN
+      # Before starting a run: if every alert is one this check covers and it's green, the alerts are stale (they lag
+      # reality by a minute or two): don't spend a run. /overall?strict=1 = disk, database, emails, backups and the
+      # strict /cluster (sites + workloads, no work-in-progress exceptions).
+      STATUS_CODE_REF: ops/platform#STATUS_CODE
+      PRECHECK_PATH: /overall?strict=1
+      DOCKER_HOST: tcp://docker-proxy:2375
+      PRECHECK_COVERS: ServerHealthRed,SiteDown,ServiceUnavailable,StatefulSetUnavailable,PodCannotStart
+      AUTOPILOT_MAX_RUNS_PER_DAY: "15"        # runs per UTC day before it stays given up
+      AUTOPILOT_IGNORE_SEVERITIES: "none,warning,notify"   # warnings go nowhere and notify goes to the error latch: no runs for either
+      AUTOPILOT_PENDING_MIN_SECONDS: "120"    # a not-yet-fired alert must be pending 2 min first (firing ones count at once):
+                                               # the original server started 15 runs a day on blips that cleared by themselves
+      # OpenBao: the address in claude.approle is used unless this is set. host.docker.internal reaches the Mac's
+      # 127.0.0.1:8200 without going through Tailscale (needed if the role gets bound to the Mac's address).
+      # BAO_ADDR: http://host.docker.internal:8200
+    volumes:
+      - ~/${ANVIL_NAME}-autopilot/state:/state                              # state.json + pinned SSH host keys
+      - ~/${ANVIL_NAME}-autopilot-runs:/runs                                # one folder per run (raw transcript: keep private)
+      - ~/${ANVIL_NAME}-autopilot/autopilot.yaml:/config/autopilot.yaml:ro  # copy of the repo's, used when the clone fails
+      - ~/${ANVIL_NAME}-openbao/claude.approle:/secrets/claude.approle:ro
+    # No Docker socket here: the mac-services skill reaches Docker through docker-proxy below, which only answers
+    # read-only queries (ps, logs, inspect) and start/restart; create, exec, run, rm and pull are refused there.
+    depends_on: [docker-proxy]
+    tmpfs:
+      - /run:mode=1777,size=32m                 # the runner makes /run/autopilot (0700) here: secrets, deleted per run
+      - /tmp:mode=1777,size=1g                  # repo clones
+      - /home/autopilot:mode=1777,size=512m,exec   # Claude Code's home (skills, session, its kubectl helper), rebuilt per run; exec: Docker's tmpfs default is noexec
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    # If the containers can't resolve the tailnet names (MagicDNS), pin them (keeps TLS name checks):
+    # extra_hosts:
+    #   - "${ANVIL_TAILNET_HOST}:${ANVIL_TAILNET_IP}"
+    #   - "${ANVIL_HOME_TAILNET_HOST}:${ANVIL_HOME_TAILNET_IP}"
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "5" }
+
+  # The only thing that holds the Mac's Docker socket: an allow-list proxy (haproxy). The autopilot may list
+  # containers, read their logs and state, and start/restart them (which ones: its guard and mac_containers).
+  docker-proxy:
+    image: docker.io/tecnativa/docker-socket-proxy:v0.5.0
+    container_name: ${ANVIL_NAME}-autopilot-docker-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"        # GET /containers/... (ps, logs, inspect)
+      ALLOW_START: "1"
+      ALLOW_RESTARTS: "1"
+      POST: "0"              # nothing else that changes anything (create, exec, run, rm, pull, build)
+      EXEC: "0"
+      IMAGES: "0"
+      VOLUMES: "0"
+      NETWORKS: "0"
+      INFO: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs: [/run, /tmp]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]   # haproxy drops to its own user at start
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Switch a node pool (infra/pools.tf) on and off, or resize it. docs: Operations → Scale a site out. Pools are billed
+by the hour, every started hour in full: never a bigger type or another pool without the owner's yes (CLAUDE.md).
+
+  scripts/pool status              every pool: count, type, nodes in the cluster
+  scripts/pool up <name>           1 node: imports the Flatcar block-storage image the first time (kept), creates
+                                   the server, waits until it is Ready in the cluster
+  scripts/pool down <name>         moves its pods away (cordon, drain), deletes the server (refused while a moved
+                                   database or a load test lives there)
+  scripts/pool direct <name> on|off [--hosts=a,b]   Cloudflare fetches the pool's sites from the pool itself
+                                   (its own Traefik, 80/443 open to Cloudflare only) instead of through the server
+  scripts/pool rescue <name>       EMERGENCY, the pool node died: DNS back, databases to atlas, volumes back, pods
+                                   off the node (each part only where it applies)
+  scripts/pool loadgen up|down     the temporary k6 machine (not in the cluster), for scripts/loadtest run
+  scripts/pool type <name> <type>  resize in place (POP2-4C-16G -> POP2-8C-32G, ...): stopped, migrated, started,
+                                   disk and IP kept
+
+Every apply is targeted at the pool's own resources and its plan is checked first: the script refuses if anything
+outside the pool (the server, the light node, their IPs) would change, or if anything but the pool would be
+destroyed. Writes the count/type to infra/pools.auto.tfvars (commit it afterwards). Terraform runs through the Makefile,
+so every TF_VAR comes from anvil.env.
+"""
+import json, os, pathlib, re, subprocess, sys, time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+os.chdir(ROOT)
+sys.path.insert(0, str(ROOT / "scripts"))
+import anvil_env  # noqa: E402
+import sites as sites_lib  # noqa: E402
+TF = "terraform"
+TFVARS = pathlib.Path("infra/pools.auto.tfvars")
+POOL_TYPES = ("scaleway_instance_server.pool", "scaleway_instance_private_nic.pool", "scaleway_instance_ip.pool",
+              "scaleway_ipam_ip.pool", "scaleway_instance_security_group.pool", "scaleway_object_bucket.pool_image",
+              "scaleway_object.pool_qcow2", "scaleway_block_snapshot.pool_flatcar", "scaleway_instance_image.pool_flatcar",
+              "scaleway_instance_server.loadgen", "scaleway_instance_ip.loadgen", "scaleway_instance_security_group.loadgen")
+DOWN_OK = ("scaleway_instance_server.pool", "scaleway_instance_private_nic.pool", "scaleway_instance_ip.pool",
+           "scaleway_ipam_ip.pool", "scaleway_instance_server.loadgen", "scaleway_instance_ip.loadgen",
+           "scaleway_instance_security_group.loadgen")
+
+
+def die(msg):
+    print(f"pool: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def say(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def env():
+    e = dict(os.environ)
+    try:
+        loaded = anvil_env.load()
+    except SystemExit:   # no anvil.env yet: --help still works, anything real fails later with a clear message
+        loaded = {}
+    for k, v in loaded.items():
+        e.setdefault(k, v)
+    return e
+
+
+SSH_PORT = env().get("ANVIL_SSH_PORT", "22")
+SSH_KEY = os.path.expanduser(env().get("ANVIL_SSH_KEY", "~/.ssh/id_ed25519_anvil"))
+
+
+def tf(*args, check=True):
+    """terraform without variables (show, output): straight. plan/apply go through make (they need every TF_VAR)."""
+    r = subprocess.run([TF, "-chdir=infra", *args], capture_output=True, text=True, env=env())
+    if check and r.returncode != 0:
+        die(f"terraform {args[0]}: {r.stderr.strip()[-1500:]}")
+    return r
+
+
+def kc(*args, check=True):
+    r = subprocess.run(["scripts/node.sh", "kubectl", *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if check and r.returncode != 0:
+        die(f"kubectl {' '.join(args[:3])}: {r.stderr.strip()[:300]}")
+    return r
+
+
+def pools():
+    """The pools block of infra/pools.auto.tfvars, parsed the simple way it is written there."""
+    t = TFVARS.read_text()
+    m = re.search(r"^pools = \{\n(.*?)^\}", t, re.S | re.M)
+    if not m:
+        die("no `pools = {` block in infra/pools.auto.tfvars")
+    out = {}
+    for name, body in re.findall(r"^  (\w[\w-]*) = \{\n(.*?)^  \}", m.group(1), re.S | re.M):
+        out[name] = dict(re.findall(r"^\s+(\w+)\s*=\s*\"?([^\"\n]+?)\"?\s*$", body, re.M))
+    return out
+
+
+def set_field(name, field, value):
+    t = TFVARS.read_text()
+    m = re.search(rf"(^  {re.escape(name)} = \{{\n)(.*?)(^  \}})", t, re.S | re.M)
+    if not m:
+        die(f"pool {name} not in infra/pools.auto.tfvars")
+    body = re.sub(rf"^(\s+{field}\s*=\s*).*$", lambda x: x.group(1) + value, m.group(2), count=1, flags=re.M)
+    TFVARS.write_text(t[:m.start(2)] + body + t[m.end(2):])
+
+
+def set_image_pipeline():
+    t = TFVARS.read_text()
+    if re.search(r"^pool_image_pipeline\s*=\s*true", t, re.M):
+        return
+    if re.search(r"^pool_image_pipeline\s*=", t, re.M):   # present but false: switch it on in place
+        TFVARS.write_text(re.sub(r"^(pool_image_pipeline\s*=\s*).*$", r"\1true", t, count=1, flags=re.M))
+        return
+    TFVARS.write_text(t.rstrip("\n") + "\n\n# The Flatcar image for pool nodes on block storage (infra/pools.tf), kept so a pool node starts in minutes.\npool_image_pipeline = true\n")
+
+
+def targets(name):
+    return [f"-target={t}" for t in POOL_TYPES]
+
+
+def plan_and_apply(name, what):
+    """Targeted plan, checked, then applied; the saved plan (it holds config values) is always deleted."""
+    try:
+        _plan_and_apply(name, what)
+    finally:
+        pathlib.Path("infra/pool.tfplan").unlink(missing_ok=True)
+
+
+def _plan_and_apply(name, what):
+    """Targeted plan, checked, then applied (the owner authorized applies; never outside the pool)."""
+    say(f"planning ({what})")
+    r = subprocess.run(["make", "-s", "plan", "TFARGS=-input=false -out=pool.tfplan " + " ".join(targets(name))],
+                       capture_output=True, text=True, env=env())
+    if r.returncode != 0:
+        die(f"terraform plan: {(r.stderr or r.stdout).strip()[-1500:]}")
+    plan = json.loads(tf("show", "-json", "pool.tfplan").stdout)
+    # Data sources (mode "data", e.g. the pool node's rendered first-boot config) are only read: they change nothing.
+    changes = [c for c in plan.get("resource_changes", [])
+               if c["change"]["actions"] != ["no-op"] and c.get("mode") != "data"]
+    for c in changes:
+        addr, acts = c["address"], c["change"]["actions"]
+        if not any(addr.startswith(p) for p in POOL_TYPES):
+            die(f"the plan would change {addr} ({'/'.join(acts)}), which is not part of a pool: refusing")
+        if "delete" in acts and not (what.startswith("down") and addr.startswith(DOWN_OK)):
+            die(f"the plan would destroy {addr}: refusing ({what})")
+    for c in changes:
+        print(f"    {'/'.join(c['change']['actions']):<16} {c['address']}")
+    if not changes:
+        say("nothing to change")
+        return
+    say(f"applying {len(changes)} change(s)")
+    # One change at a time: in parallel, Scaleway refused to delete the private NIC while its server and IPAM IP were
+    # being deleted ("Can't delete a private network interface attached to a server", 2026-11-07).
+    r = subprocess.run(["make", "-s", "apply", "TFARGS=-input=false -parallelism=1 pool.tfplan"], text=True, env=env())
+    pathlib.Path("infra/pool.tfplan").unlink(missing_ok=True)
+    if r.returncode != 0:
+        die("apply failed (see above)")
+    subprocess.run(["make", "secrets-encrypt"], capture_output=True)   # the state changed: its encrypted twin too
+
+
+def pin_k3s():
+    """Pool nodes run the master's exact k3s version (never newer): ANVIL_AGENT_K3S_VERSION in anvil.env, from the
+    running master, once (the Makefile passes it to Terraform)."""
+    if env().get("ANVIL_AGENT_K3S_VERSION"):
+        return
+    v = kc("get", "nodes", "-l", "node-role.kubernetes.io/control-plane", "-o",
+           "jsonpath={.items[0].status.nodeInfo.kubeletVersion}").stdout.strip()
+    if not v:
+        die("couldn't read the master's k3s version")
+    p = pathlib.Path("anvil.env")
+    p.write_text(p.read_text().rstrip("\n") + f"\nANVIL_AGENT_K3S_VERSION={v}   # pool nodes run the master's version (scripts/pool)\n")
+    os.environ["ANVIL_AGENT_K3S_VERSION"] = v
+    say(f"pool nodes pinned to the master's k3s {v} (anvil.env)")
+
+
+def cmd_status():
+    nodes = json.loads(kc("get", "nodes", "-l", "anvil/pool", "-o", "json").stdout)["items"]
+    for name, p in pools().items():
+        mine = [n for n in nodes if n["metadata"]["labels"].get("anvil/pool") == name]
+        ready = [n["metadata"]["name"] for n in mine
+                 if any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"]["conditions"])]
+        print(f"{name}: count {p.get('count')}, type {p.get('type')}, disk {p.get('disk_gb')} GB; "
+              f"in the cluster: {', '.join(ready) or 'none'}")
+
+
+def cmd_up(name):
+    p = pools().get(name) or die(f"no pool {name}")
+    pin_k3s()
+    set_image_pipeline()
+    set_field(name, "count", "1")
+    plan_and_apply(name, "up")
+    say("waiting for the node to join the cluster (about 2-5 minutes)")
+    for _ in range(120):
+        r = kc("get", "nodes", "-l", f"anvil/pool={name}", "-o", "json", check=False)
+        items = json.loads(r.stdout or '{"items":[]}')["items"] if r.returncode == 0 else []
+        if items and any(c["type"] == "Ready" and c["status"] == "True" for c in items[0]["status"]["conditions"]):
+            n = items[0]
+            say(f"{n['metadata']['name']} is Ready (labels: pool={name}, trusted="
+                f"{n['metadata']['labels'].get('anvil/trusted', 'no')}; {p.get('type')})")
+            out = json.loads(tf("output", "-json", "pool_nodes").stdout)
+            for v in out.values():   # new server, maybe on a reused address: forget any old host key for it
+                subprocess.run(["ssh-keygen", "-R", f"[{v['public_ip']}]:{SSH_PORT}"], capture_output=True)
+            for k, v in out.items():
+                print(f"    {k}: public {v['public_ip']}, private {v['private_ip']}")
+            key = p.get("ssh_public_key_path", "").replace(".pub", "") or SSH_KEY
+            print(f"    ssh: ssh -i {key} -p {SSH_PORT} core@<public ip>")
+            return
+        time.sleep(5)
+    die("the node didn't become Ready in 10 minutes: check `scripts/node.sh kubectl get nodes` and the server's console")
+
+
+def cmd_down(name):
+    pools().get(name) or die(f"no pool {name}")
+    for ns, mv in sites_lib.moves().items():
+        if mv.get("pool") != name:
+            continue
+        r = kc("-n", ns, "get", "configmap", f"{ns}-mariadb-move", "-o", "jsonpath={.data.phase}", check=False)
+        if r.returncode == 0 and r.stdout in ("moved", "following-back"):
+            die(f"{ns}'s database lives on this pool ({r.stdout}): scripts/move-db {ns} back-follow, back first")
+    if pools()[name].get("direct") == "true":
+        die(f"direct mode is on: scripts/pool direct {name} off first (the hosts would point at a deleted server)")
+    lt = kc("get", "namespace", "-l", "anvil/loadtest=true", "-o", "name", check=False).stdout.split()
+    if lt:
+        die(f"a load test still exists ({', '.join(lt)}): scripts/loadtest <ns> down first")
+    nodes = json.loads(kc("get", "nodes", "-l", f"anvil/pool={name}", "-o", "json").stdout)["items"]
+    for n in nodes:
+        nn = n["metadata"]["name"]
+        say(f"moving pods off {nn}")
+        kc("cordon", nn)
+        # Workloads that merely prefer the pool restart elsewhere first (rolling: no downtime), then the drain.
+        pods = json.loads(kc("get", "pods", "-A", "--field-selector", f"spec.nodeName={nn}", "-o", "json").stdout)["items"]
+        seen = set()
+        for pod in pods:
+            for ref in pod["metadata"].get("ownerReferences", []):
+                if ref["kind"] == "ReplicaSet":
+                    dep = ref["name"].rsplit("-", 1)[0]
+                    key = (pod["metadata"]["namespace"], dep)
+                    if key not in seen:
+                        seen.add(key)
+                        kc("-n", key[0], "rollout", "restart", f"deploy/{dep}", check=False)
+                        kc("-n", key[0], "rollout", "status", f"deploy/{dep}", "--timeout=300s", check=False)
+        kc("drain", nn, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=300s", check=False)
+    # Scaleway refuses to detach a private NIC from a running server ("precondition failed", 2026-11-07): power the
+    # (drained) servers off first, then the plan deletes NIC, server and IPs.
+    for n in nodes:
+        poweroff(n["metadata"]["name"])
+    set_field(name, "count", "0")
+    plan_and_apply(name, "down")
+    for n in nodes:
+        kc("delete", "node", n["metadata"]["name"], "--ignore-not-found", check=False)
+    say(f"pool {name} is down: nothing of it is billed now except the kept Flatcar image")
+
+
+def set_loadgen(count):
+    t = TFVARS.read_text()
+    t2 = re_sub_count(t)(count)
+    TFVARS.write_text(t2)
+
+
+def re_sub_count(t):
+    def f(count):
+        n, k = re.subn(r"^(loadgen = \{ count = )\d+", lambda m: m.group(1) + str(count), t, flags=re.M)
+        if k != 1:
+            die("no `loadgen = { count = ... }` line in infra/pools.auto.tfvars")
+        return n
+    return f
+
+
+def loadgen_ip():
+    return tf("output", "-raw", "loadgen_ip", check=False).stdout.strip()
+
+
+def cmd_loadgen(action):
+    if action == "up":
+        set_image_pipeline()
+        set_loadgen(1)
+        plan_and_apply("loadgen", "up loadgen")
+        ip = loadgen_ip()
+        # A fresh machine on a reused address has a new host key: forget the old one (else SSH refuses it).
+        subprocess.run(["ssh-keygen", "-R", ip], capture_output=True)
+        m = re.search(r'ssh_public_key_path = "([^"]+)"', TFVARS.read_text().split("loadgen = ", 1)[1])
+        key = os.path.expanduser(m.group(1).replace(".pub", "")) if m else SSH_KEY
+        say(f"waiting for SSH on {ip}")
+        for _ in range(60):
+            r = subprocess.run(["ssh", "-i", key, "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=5",
+                                "-o", "BatchMode=yes", f"core@{ip}", "docker version --format '{{.Server.Version}}'"],
+                               capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if r.returncode == 0:
+                say(f"loadgen ready at {ip} (Docker {r.stdout.strip()})")
+                print(ip)
+                return
+            time.sleep(5)
+        die("the k6 machine didn't answer on SSH in 5 minutes")
+    elif action == "down":
+        set_loadgen(0)
+        plan_and_apply("loadgen", "down loadgen")
+        say("loadgen deleted")
+    else:
+        die("usage: scripts/pool loadgen up|down")
+
+
+def scw(method, path, body=None):
+    import urllib.request
+    req = urllib.request.Request(f"https://api.scaleway.com/instance/v1/zones/{env().get('ANVIL_ZONE', 'fr-par-1')}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"X-Auth-Token": env()["SCW_SECRET_KEY"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def poweroff(server_name):
+    found = scw("GET", f"/servers?name={server_name}")["servers"]
+    for srv in [x for x in found if x["name"] == server_name]:
+        if srv["state"] != "stopped":
+            say(f"powering off {server_name}")
+            scw("POST", f"/servers/{srv['id']}/action", {"action": "poweroff"})
+        for _ in range(60):
+            if scw("GET", f"/servers/{srv['id']}")["server"]["state"] == "stopped":
+                say(f"{server_name} is stopped")
+                break
+            time.sleep(5)
+        else:
+            die(f"{server_name} didn't stop in 5 minutes")
+        # The provider's own NIC delete is refused ("Can't delete a private network interface attached to a server",
+        # 2026-11-07, twice, even stopped and one change at a time); the API's DELETE works: do it here, Terraform then
+        # finds the NIC gone and deletes the rest.
+        for nic in scw("GET", f"/servers/{srv['id']}/private_nics").get("private_nics", []):
+            scw("DELETE", f"/servers/{srv['id']}/private_nics/{nic['id']}")
+            say(f"{server_name}: private NIC {nic['id'][:8]} detached")
+
+
+TRAEFIK_TPL = pathlib.Path("scripts/templates/pool-traefik.yaml.tpl")
+
+
+def pool_ip(name):
+    out = json.loads(tf("output", "-json", "pool_nodes").stdout or "{}")
+    return out.get(f"{name}-0", {}).get("public_ip", "")
+
+
+def through_pool(host, ip, path="/"):
+    """A request to `host` sent straight to the pool's Traefik, presenting the origin-pull client certificate as
+    Cloudflare does. From the server to the pool's PRIVATE address: its public 443 admits only Cloudflare's ranges, and
+    security groups don't filter the private network. Returns the HTTP status. (`ip` is unused: kept for callers.)"""
+    priv = json.loads(tf("output", "-json", "pool_nodes").stdout or "{}")
+    priv = next((v["private_ip"] for v in priv.values()), "")
+    aop = pathlib.Path(env().get("ANVIL_DATA_DIR", ".data")) / "cloudflare-aop"
+    cert = (aop / "client.crt").read_text() + (aop / "client.key").read_text()
+    r = subprocess.run(["scripts/node.sh", "ssh", f"umask 077; f=$(mktemp); cat > $f; curl -sk --cert $f -o /dev/null "
+                        f"-w '%{{http_code}}' -m 15 --resolve {host}:443:{priv} https://{host}{path}; rm -f $f"],
+                       input=cert, capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def cutover(ip, hosts):
+    r = subprocess.run(["python3", "-I", "scripts/cutover.py", ip, *hosts], capture_output=True, text=True, env=env())
+    if r.returncode != 0:
+        die(f"DNS change failed: {(r.stderr or r.stdout).strip()[-400:]}")
+    for l in r.stdout.strip().splitlines()[-len(hosts):]:
+        say(f"  {l}")
+
+
+def cmd_direct(name, action, hosts):
+    p = pools().get(name) or die(f"no pool {name}")
+    hosts = hosts or subprocess.run(["python3", "-I", "scripts/sites.py", "hosts", name], capture_output=True,
+                                    text=True).stdout.split()
+    if not hosts:
+        die(f"no hosts for {name} (sites.py hosts {name}); pass --hosts=a,b")
+    if action == "on":
+        ip = pool_ip(name) or die(f"pool {name} is not up")
+        set_field(name, "direct", "true") if re.search(r"^\s+direct\s*=", TFVARS.read_text().split(f"  {name} = {{", 1)[1].split("\n  }", 1)[0], re.M) else add_field(name, "direct", "true")
+        plan_and_apply(name, "direct on")
+        tr = json.loads(kc("-n", "kube-system", "get", "deploy", "traefik", "-o", "json").stdout)["spec"]["template"]["spec"]["containers"][0]
+        trusted = next(a.split("=", 1)[1] for a in tr["args"] if a.startswith("--entryPoints.websecure.forwardedHeaders.trustedIPs="))
+        t = TRAEFIK_TPL.read_text().replace("${POOL}", name).replace("${IMAGE}", tr["image"]).replace("${TRUSTED}", trusted)
+        subprocess.run(["scripts/node.sh", "kubectl", "apply", "-f", "-"], input=t, text=True, check=True, capture_output=True)
+        kc("-n", "kube-system", "rollout", "status", f"deploy/traefik-pool-{name}", "--timeout=300s")
+        for _ in range(24):
+            codes = {h: through_pool(h, ip) for h in hosts}
+            if all(c and (c[0] in "23" or c == "401") for c in codes.values()):
+                break
+            time.sleep(5)
+        say(f"the pool's Traefik answers: {codes}")
+        if not all(c and (c[0] in "23" or c == "401") for c in codes.values()):
+            die("not every host answers through the pool: DNS left as it was (scripts/pool direct off to undo the rest)")
+        say(f"pointing {', '.join(hosts)} at the pool ({ip}), still proxied by Cloudflare")
+        cutover(ip, hosts)
+        say("direct mode ON: Cloudflare fetches these hosts from the pool; the server's Traefik is out of their path")
+    elif action == "off":
+        server_ip = env().get("ANVIL_SERVER_IP") or die("ANVIL_SERVER_IP missing in anvil.env")
+        say(f"pointing {', '.join(hosts)} back at the server ({server_ip})")
+        cutover(server_ip, hosts)
+        say("waiting 30 s for connections Cloudflare still has open to the pool")
+        time.sleep(30)
+        kc("-n", "kube-system", "delete", "deploy", f"traefik-pool-{name}", "--ignore-not-found")
+        if re.search(r"^\s+direct\s*=", TFVARS.read_text(), re.M):
+            set_field(name, "direct", "false")
+        plan_and_apply(name, "direct off")
+        say("direct mode OFF: these hosts go through the server again; the pool's 80/443 are closed")
+    else:
+        die("usage: scripts/pool direct <name> on|off [--hosts=a,b]")
+
+
+def cmd_rescue(name):
+    """EMERGENCY: the pool node is dead or unusable. Get its sites running on the server again without it, in order:
+    DNS back to the server (direct mode), each moved database back to atlas (failover-to-atlas, atlas has been following
+    it), the apps' volumes back to their copies on the server, then the pods off the node. Everything it can't fix, it says."""
+    pools().get(name) or die(f"no pool {name}")
+    sites = sites_lib.namespaces()
+    moved = [ns for ns, v in sites.items() if (v.get("move") or {}).get("pool") == name]
+    if pools()[name].get("direct") == "true":
+        hosts = sum((subprocess.run(["python3", "-I", "scripts/sites.py", "hosts", ns], capture_output=True, text=True).stdout.split() for ns in moved), [])
+        say(f"1. DNS: {', '.join(hosts)} back to the server")
+        cutover(env().get("ANVIL_SERVER_IP") or die("ANVIL_SERVER_IP missing in anvil.env"), hosts)
+        set_field(name, "direct", "false")
+    else:
+        say("1. DNS: direct mode is off, nothing to change")
+    for ns in moved:
+        ph = kc("-n", ns, "get", "configmap", f"{ns}-mariadb-move", "-o", "jsonpath={.data.phase}", check=False).stdout
+        if ph == "following-back":
+            say(f"2. {ns}: atlas has been following its database: failing over to atlas")
+            subprocess.run(["scripts/move-db", ns, "failover-to-atlas"], check=False)
+        elif ph == "moved":
+            say(f"2. {ns}: MOVED BUT ATLAS WAS NOT FOLLOWING: atlas holds the state of the cutover only. Its live data is on "
+                f"the pool node's disk; if the node can't come back, restore {ns} from its last off-site backup "
+                f"(daily/<date>/mariadb-{ns}/; docs: Operations → Scale a site out). Not switched automatically.")
+        else:
+            say(f"2. {ns}: database on atlas ({ph or 'never moved'}), nothing to do")
+        vols = (sites[ns].get("move") or {}).get("volumes", [])
+        st = kc("-n", ns, "get", "configmap", f"{ns}-mariadb-move", "-o", "jsonpath={.data.volumes}", check=False).stdout
+        for v in vols if st == "pool" else []:
+            dep = json.loads(kc("-n", ns, "get", "deploy", v["deployment"], "-o", "json").stdout)
+            idx = [i for i, x in enumerate(dep["spec"]["template"]["spec"]["volumes"])
+                   if (x.get("persistentVolumeClaim") or {}).get("claimName") == f"{v['claim']}-pool"]
+            if idx:
+                kc("-n", ns, "patch", "deploy", v["deployment"], "--type", "json", "-p", json.dumps([{"op": "replace",
+                   "path": f"/spec/template/spec/volumes/{idx[0]}/persistentVolumeClaim/claimName", "value": v["claim"]}]))
+                say(f"3. {ns}/{v['deployment']}: back on {v['claim']} (files written on the pool since the move are lost)")
+    for n in json.loads(kc("get", "nodes", "-l", f"anvil/pool={name}", "-o", "json").stdout)["items"]:
+        nn = n["metadata"]["name"]
+        kc("cordon", nn, check=False)
+        kc("delete", "pods", "-A", "--field-selector", f"spec.nodeName={nn}", "--force", "--grace-period=0", check=False)
+        say(f"4. {nn}: cordoned, its pods deleted (they start again on the server)")
+    say(f"rescue done. Check the sites, then scripts/pool down {name} once its server can be deleted")
+
+
+def add_field(name, field, value):
+    t = TFVARS.read_text()
+    m = re.search(rf"(^  {re.escape(name)} = \{{\n)", t, re.M)
+    TFVARS.write_text(t[:m.end()] + f"    {field:<19} = {value}\n" + t[m.end():])
+
+
+def cmd_type(name, typ):
+    pools().get(name) or die(f"no pool {name}")
+    # A bigger server is the owner's decision (CLAUDE.md): say the size, the hourly price and that it restarts.
+    if not os.environ.get("POOL_TYPE_CONFIRMED"):
+        die(f"resizing {name} to {typ} restarts it (about a minute) and starts a new billed hour at the new price: "
+            f"ask the owner first, then run again with POOL_TYPE_CONFIRMED=1")
+    if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9-]+", typ):
+        die(f"{typ} doesn't look like a Scaleway type")
+    set_field(name, "type", f'"{typ}"')
+    plan_and_apply(name, f"type {typ}")
+    say(f"pool {name} is now {typ} (if it was up, it was stopped, migrated and started again)")
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] == ["status"]:
+        cmd_status()
+    elif a[:1] == ["up"] and len(a) == 2:
+        cmd_up(a[1])
+    elif a[:1] == ["down"] and len(a) == 2:
+        cmd_down(a[1])
+    elif a[:1] == ["direct"] and len(a) >= 3:
+        hosts = next((x.split("=", 1)[1].split(",") for x in a[3:] if x.startswith("--hosts=")), [])
+        cmd_direct(a[1], a[2], hosts)
+    elif a[:1] == ["rescue"] and len(a) == 2:
+        cmd_rescue(a[1])
+    elif a[:1] == ["loadgen"] and len(a) == 2:
+        cmd_loadgen(a[1])
+    elif a[:1] == ["type"] and len(a) == 3:
+        cmd_type(a[1], a[2])
+    else:
+        print(__doc__)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

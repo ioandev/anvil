@@ -1,0 +1,238 @@
+# anvil-demo: the guestbook used to show anvil live (break it -> alert -> autopilot fixes it). Source: demo/.
+#
+# What's here: Namespace; web (2 replicas, zero-downtime rolling deploys) and worker (singleton queue processor),
+# both from one image; Services anvil-demo-web (80 -> app, 9090 -> metrics), anvil-demo-web-peers (headless, so
+# /admin/break and /admin/fix reach every web pod) and anvil-demo-worker (8081: probes, metrics, admin; never public);
+# Ingress for demo.${ANVIL_DOMAIN}.
+#
+# The platform provides (deploy fails with CreateContainerConfigError without them, rule 14):
+#   - Secret atlas-db   (DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD): written by make-secrets from its `db:` in sites.yaml
+#                        ("anvil-demo": "anvil_demo"); the app gets the project's _rw user.
+#   - Secret anvil-demo (ADMIN_TOKEN): from apps/anvil-demo/prod.env (SOPS twin in git).
+#   - ${ANVIL_REGISTRY}, ${ANVIL_DEMO_TAG}, ${ANVIL_DOMAIN}: substituted at deploy time.
+#
+# Rules (CLAUDE.md "Rules for every app"): own namespace (1), anvil-demo-* Service names (2), own UIDs 6000 web /
+# 6001 worker, 6002 reserved for a backup job (3), enableServiceLinks false (5), worker singleton + Recreate (6),
+# client IP from CF-Connecting-IP (7), no secrets here (8), Traefik websecure + tls.hosts, no certresolver (9),
+# readiness + liveness with the platform's liveness timings (11, 15), standard labels (17).
+# One deliberate difference from rule 11's "same endpoint": liveness is /healthz (process only) and readiness /readyz
+# (database too), so a database outage takes pods out of rotation instead of restart-looping them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: anvil-demo
+  labels: { app.kubernetes.io/part-of: anvil-demo, app.kubernetes.io/managed-by: anvil, anvil/tier: app }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-demo-web
+  namespace: anvil-demo
+  labels:
+    app.kubernetes.io/name: anvil-demo-web
+    app.kubernetes.io/part-of: anvil-demo
+    app.kubernetes.io/component: web
+    app.kubernetes.io/managed-by: anvil
+    anvil/tier: app
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5                            # `kubectl rollout undo` needs the previous ReplicaSet
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 } # a new pod must be ready before an old one goes
+  selector: { matchLabels: { app: anvil-demo-web } }
+  template:
+    metadata:
+      labels:
+        app: anvil-demo-web
+        app.kubernetes.io/name: anvil-demo-web
+        app.kubernetes.io/part-of: anvil-demo
+        app.kubernetes.io/component: web
+        app.kubernetes.io/managed-by: anvil
+        anvil/tier: app
+    spec:
+      enableServiceLinks: false                      # rule 5
+      automountServiceAccountToken: false
+      # Scale-out: when the demo's pool is up (scripts/pool up demo) these pods prefer it and may run there; without it
+      # they run here as always. scripts/move-db moves the database the same way.
+      tolerations: [{ key: anvil/dedicated, operator: Equal, value: demo, effect: NoSchedule }]
+      affinity: { nodeAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [{ weight: 100, preference: { matchExpressions: [{ key: anvil/pool, operator: In, values: [demo] }] } }] } }
+      terminationGracePeriodSeconds: 30              # preStop 5 s + the app's own <= 10 s graceful shutdown
+      securityContext:                               # rule 3
+        runAsUser: 6000
+        runAsGroup: 6000
+        fsGroup: 6000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: web
+          image: "${ANVIL_REGISTRY}/anvil-demo:${ANVIL_DEMO_TAG}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - { name: http, containerPort: 8080 }
+            - { name: metrics, containerPort: 9090 }
+          envFrom:
+            - secretRef: { name: atlas-db }          # DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+          env:
+            - name: ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: anvil-demo, key: ADMIN_TOKEN } }
+            - { name: PORT, value: "8080" }
+            - { name: METRICS_PORT, value: "9090" }
+            - { name: PEERS_HOST, value: anvil-demo-web-peers.anvil-demo.svc.cluster.local }
+            - { name: WORKER_ADMIN_URL, value: "http://anvil-demo-worker.anvil-demo.svc:8081" }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - { name: RATE_LIMIT_MAX, value: "5" }
+            - { name: RATE_LIMIT_WINDOW_SECONDS, value: "60" }
+            - { name: NODE_OPTIONS, value: "--max-old-space-size=96" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 20m, memory: 64Mi }
+            limits: { memory: 160Mi }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+          lifecycle:
+            preStop: { sleep: { seconds: 5 } }       # no shell in the image: the kubelet's own sleep action
+          readinessProbe:                            # /readyz: the database answers (it's the demo's point). Generous
+            httpGet: { path: /readyz, port: http }   # timing, so a pod that is only busy isn't taken out of service
+            periodSeconds: 5                         # (CAPACITY.md: a 1-second check turned "slow" into "503 for everyone")
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:                             # rule 11
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - { name: tmp, emptyDir: { sizeLimit: 16Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anvil-demo-worker
+  namespace: anvil-demo
+  labels:
+    app.kubernetes.io/name: anvil-demo-worker
+    app.kubernetes.io/part-of: anvil-demo
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/managed-by: anvil
+    anvil/tier: app
+spec:
+  replicas: 1                                        # rule 6: singleton
+  revisionHistoryLimit: 5
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: anvil-demo-worker } }
+  template:
+    metadata:
+      labels:
+        app: anvil-demo-worker
+        app.kubernetes.io/name: anvil-demo-worker
+        app.kubernetes.io/part-of: anvil-demo
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/managed-by: anvil
+        anvil/tier: app
+    spec:
+      enableServiceLinks: false
+      automountServiceAccountToken: false
+      # Scale-out: when the demo's pool is up (scripts/pool up demo) these pods prefer it and may run there; without it
+      # they run here as always. scripts/move-db moves the database the same way.
+      tolerations: [{ key: anvil/dedicated, operator: Equal, value: demo, effect: NoSchedule }]
+      affinity: { nodeAffinity: { preferredDuringSchedulingIgnoredDuringExecution: [{ weight: 100, preference: { matchExpressions: [{ key: anvil/pool, operator: In, values: [demo] }] } }] } }
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsUser: 6001
+        runAsGroup: 6001
+        fsGroup: 6001
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: worker
+          image: "${ANVIL_REGISTRY}/anvil-demo:${ANVIL_DEMO_TAG}"
+          imagePullPolicy: IfNotPresent
+          args: ["dist/worker.js"]                   # same image, the base image's entrypoint is node
+          ports: [{ name: http, containerPort: 8081 }]
+          envFrom:
+            - secretRef: { name: atlas-db }
+          env:
+            - name: ADMIN_TOKEN
+              valueFrom: { secretKeyRef: { name: anvil-demo, key: ADMIN_TOKEN } }
+            - { name: WORKER_PORT, value: "8081" }
+            - { name: WORKER_INTERVAL_SECONDS, value: "5" }
+            - { name: NODE_OPTIONS, value: "--max-old-space-size=64" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 10m, memory: 48Mi }
+            limits: { memory: 128Mi }
+          volumeMounts: [{ name: tmp, mountPath: /tmp }]
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:                             # process only: a *stuck* queue is the heartbeat alert's job
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        - { name: tmp, emptyDir: { sizeLimit: 16Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil-demo-web
+  namespace: anvil-demo
+  labels: { app.kubernetes.io/part-of: anvil-demo, app.kubernetes.io/component: web, app.kubernetes.io/managed-by: anvil, anvil/tier: app }
+spec:
+  selector: { app: anvil-demo-web }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+    - { name: metrics, port: 9090, targetPort: metrics }  # Prometheus only; the Ingress routes to http
+---
+# Headless, including pods that aren't ready: /admin/break and /admin/fix fan out to every web pod through it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil-demo-web-peers
+  namespace: anvil-demo
+  labels: { app.kubernetes.io/part-of: anvil-demo, app.kubernetes.io/component: web, app.kubernetes.io/managed-by: anvil, anvil/tier: app }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: anvil-demo-web }
+  ports: [{ name: http, port: 8080, targetPort: http }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anvil-demo-worker
+  namespace: anvil-demo
+  labels: { app.kubernetes.io/part-of: anvil-demo, app.kubernetes.io/component: worker, app.kubernetes.io/managed-by: anvil, anvil/tier: app }
+spec:
+  selector: { app: anvil-demo-worker }
+  ports: [{ name: http, port: 8081, targetPort: http }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: anvil-demo
+  namespace: anvil-demo
+  labels: { app.kubernetes.io/part-of: anvil-demo, app.kubernetes.io/component: web, app.kubernetes.io/managed-by: anvil, anvil/tier: app }
+  annotations: { traefik.ingress.kubernetes.io/router.entrypoints: websecure }
+spec:
+  ingressClassName: traefik                          # rule 9: websecure, tls.hosts, no certresolver
+  tls: [{ hosts: ["demo.${ANVIL_DOMAIN}"] }]
+  rules:
+    - host: "demo.${ANVIL_DOMAIN}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: anvil-demo-web, port: { name: http } } }

@@ -1,0 +1,54 @@
+---
+title: 'Decision: Scaleway'
+description: Why one Scaleway instance (a DEV1 with local SSD) hosts everything.
+---
+
+**Status:** accepted (2026-07, the original server sized up to a DEV1-L in 2026-10).
+
+## Context
+
+Many small projects, one owner, a hobby budget, users mostly in Europe. Needs: a VM with enough RAM for a dozen
+apps, an object store for backups, a container registry, transactional email, and an API that Terraform drives.
+
+## Decision
+
+Run everything on **one Scaleway instance** in `fr-par-1`. The original server is a **DEV1-L**: 4 vCPU, 8 GB RAM and 80 GB of
+**local SSD included in the price** as the root disk (no block volumes). The same account provides Object Storage
+(backups, the image import), the container registry and **Transactional Email (TEM)**.
+
+## Consequences
+
+- + EU provider and region; predictable monthly price; one bill and one IAM for compute, storage, registry, email.
+- + Local SSD is fast and free with the instance; databases live on it via k3s local-path volumes.
+- − **Local SSD dies with the instance**: hence the nightly off-site backups and a tested restore path.
+- − **Outbound SMTP ports 25, 465 and 587 are blocked on instances.** Apps send mail through TEM on its alternate
+  ports **2587** (STARTTLS) or 2465 (TLS), or its HTTP API (what the backup jobs use).
+- − **No Flatcar in the marketplace**: the qcow2 must be imported (bucket → snapshot → image), a few minutes
+  of extra Terraform. Managed Kubernetes (Kapsule) can't use Flatcar at all.
+- − API keys can be created **with an expiry** and then fail silently: create them without one.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| DEV1-S (2 vCPU / 2 GB, ~€6.34/month in 2026-07) | the original single-site choice; too small for ~20 projects plus monitoring |
+| PLAY2-PICO | more expensive than DEV1-S at research time, block storage only |
+| Scaleway Kapsule (managed k8s) | its node agent doesn't support immutable OSes such as Flatcar |
+| One server per project | more bills, more patching, more to monitor; the original server replaced four servers |
+
+## How it was decided
+
+- Claude listed every Scaleway type with ≥ 8 GB from the **public products API** (about 95, no credentials needed) and
+  recommended the DEV1-L: the cheapest x86 with 8 GB and 4 vCPU, local SSD included. ARM types were out because
+  Flatcar's Scaleway image is x86_64.
+- When RAM ran short on day 2 (0.9 GB free), the options were a DEV1-XL (12 GB, ~€47/month) or Hetzner. Merging the
+  databases freed ~1.5 GB instead, and the box stayed a DEV1-L.
+- The shared vCPUs showed 28–39 % steal. A slow blog was fixed with an index and an edge cache rather than a
+  dedicated-CPU instance (~€54/month).
+- Dropping the IPv4 to save money was rejected: outbound IPv4 is needed (code hosts, Twilio, Discord, email) and
+  Scaleway has no NAT64.
+
+| More alternatives | Why not |
+|---|---|
+| BASIC2 (ARM, ~€25), BASIC3 (~€43), POP2 dedicated CPU (~€54), DEV1-XL (~€47) | ARM doesn't fit Flatcar's image; the others cost more for this load |
+| Hetzner dedicated (AX41, ~€59, 64 GB) | better hardware per euro, but bare metal: no snapshots, no Terraform for dedicated servers, Flatcar via rescue mode, firewall in nftables. Hetzner Cloud would be the like-for-like move |

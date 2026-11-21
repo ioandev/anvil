@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Watch what an anonymous phone visitor gets from Cloudflare's cache, over hours (docs: Components → Edge).
+
+  scripts/edge-cache-monitor run [--hours 12] [--out FILE]   sample, then write a report next to FILE
+  scripts/edge-cache-monitor report FILE                     summarise a run (also while it's running)
+
+Each round fetches every edge-cached site's warm pages (sites.yaml `edge_cache.warm`, default /) as Chrome on Android
+with no cookies, and records cf-cache-status, the age of the
+cached copy, the Cloudflare location (cf-ray) and the timings (DNS, connect, TLS, first byte, total).
+
+Rounds are 20-40 minutes apart (random), on purpose: more often, and the monitor itself would keep the cache at its
+own Cloudflare location warm and only ever see HITs. So each sample is "a visitor arriving after a gap", the case
+that matters. Run it from a machine that reaches the same Cloudflare location as the visitors you care about. Output: CSV (one row per request) and FILE.report.txt.
+"""
+import csv
+import datetime as dt
+import os
+import pathlib
+import random
+import re
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+UA = "Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36"
+HTML = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+IMG = "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+
+
+def targets():
+    """(name, url, accept) for every warm page of every edge-cached site in sites.yaml."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import sites
+    out = []
+    for ns, v in sites.namespaces().items():
+        ec = v.get("edge_cache")
+        if not ec:
+            continue
+        for h in ec.get("hosts") or v.get("hosts") or []:
+            for path in ec.get("warm") or ["/"]:
+                out.append((f"{h}{path}", f"https://{h}{path}", HTML))
+    return out
+
+
+FIELDS = ["time", "name", "url", "code", "cache", "age", "pop", "dns", "connect", "tls", "ttfb", "total", "bytes"]
+
+
+def fetch(url, accept):
+    fmt = "%{http_code} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{size_download}"
+    p = subprocess.run(["curl", "-s", "-o", "/dev/null", "-D", "-", "--compressed", "-m", "30", "-A", UA,
+                        "-H", f"Accept: {accept}", "-H", "Accept-Language: en-GB,en;q=0.9", "-w", "\n@@" + fmt, url],
+                       capture_output=True, text=True, timeout=40)
+    head, _, w = p.stdout.rpartition("\n@@")
+    h = {}
+    for line in head.replace("\r", "").split("\n"):
+        k, sep, v = line.partition(":")
+        if sep:
+            h[k.strip().lower()] = v.strip()
+    code, dns, conn, tls, ttfb, total, size = (w.split() + ["0"] * 7)[:7]
+    return {"code": code, "cache": h.get("cf-cache-status", "-"), "age": h.get("age", ""),
+            "pop": h.get("cf-ray", "-").rpartition("-")[2], "dns": dns, "connect": conn, "tls": tls,
+            "ttfb": ttfb, "total": total, "bytes": size}
+
+
+def run(hours, out):
+    end = time.time() + hours * 3600
+    new = not os.path.exists(out)
+    with open(out, "a", newline="") as f:
+        w = csv.DictWriter(f, FIELDS)
+        if new:
+            w.writeheader()
+        n = 0
+        while time.time() < end:
+            urls = targets()
+            random.shuffle(urls)  # no fixed order, so no URL is always first after a quiet spell
+            for name, url, accept in urls:
+                try:
+                    r = fetch(url, accept)
+                except Exception as e:
+                    r = {k: "" for k in FIELDS} | {"code": "ERR", "cache": type(e).__name__}
+                r.update(time=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), name=name, url=url)
+                w.writerow(r)
+                f.flush()
+                time.sleep(random.uniform(1, 4))
+            n += 1
+            print(f"{dt.datetime.now():%H:%M} round {n} done", flush=True)
+            time.sleep(min(random.uniform(20 * 60, 40 * 60), max(0, end - time.time())))
+    rep = report(out)
+    with open(out + ".report.txt", "w") as f:
+        f.write(rep)
+    print(rep)
+
+
+def report(path):
+    rows = list(csv.DictReader(open(path)))
+    if not rows:
+        return "no samples yet\n"
+    fl = lambda x: float(x) if x not in ("", None) else 0.0
+    by = defaultdict(list)
+    for r in rows:
+        by[r["name"]].append(r)
+    out = [f"edge-cache monitor: {len(rows)} requests, {rows[0]['time']} → {rows[-1]['time']}, "
+           f"Cloudflare locations: {', '.join(sorted(set(r['pop'] for r in rows)))}", "",
+           f"{'page':28} {'n':>3} {'HIT':>5} {'MISS':>5} {'other':>6}  {'first byte: HIT':>15} {'MISS':>7}  {'worst total':>11}"]
+    for name in sorted(by):
+        rs = by[name]
+        hit = [r for r in rs if r["cache"] in ("HIT", "REVALIDATED", "UPDATING", "STALE")]
+        miss = [r for r in rs if r["cache"] in ("MISS", "EXPIRED")]
+        avg = lambda xs: f"{sum(fl(r['ttfb']) for r in xs) / len(xs):.2f}s" if xs else "-"
+        worst = max(rs, key=lambda r: fl(r["total"]))
+        out.append(f"{name[:28]:28} {len(rs):3} {len(hit):5} {len(miss):5} {len(rs) - len(hit) - len(miss):6}  "
+                   f"{avg(hit):>15} {avg(miss):>7}  {fl(worst['total']):9.2f}s")
+    slow = [r for r in rows if fl(r["total"]) > 1.0 or r["code"] not in ("200",)]
+    out += ["", f"slow (> 1 s) or failed: {len(slow)}"]
+    for r in slow[:40]:
+        out.append(f"  {r['time']} {r['name'][:28]:28} {r['code']} {r['cache']:8} age {r['age'] or '-':>5} {r['pop']} "
+                   f"dns {fl(r['dns']):.2f} connect {fl(r['connect']):.2f} tls {fl(r['tls']):.2f} ttfb {fl(r['ttfb']):.2f} total {fl(r['total']):.2f}")
+    other = sorted(set(r["cache"] for r in rows) - {"HIT", "MISS", "EXPIRED", "REVALIDATED", "UPDATING", "STALE"})
+    out += ["", "cache status meanings: HIT = from Cloudflare; MISS/EXPIRED = fetched from the server (or the upper tier); "
+            "DYNAMIC = not cacheable (a rule didn't match)" + (f"; seen also: {', '.join(other)}" if other else "")]
+    return "\n".join(out) + "\n"
+
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[:1] == ["run"]:
+        hours = float(a[a.index("--hours") + 1]) if "--hours" in a else 12
+        out = a[a.index("--out") + 1] if "--out" in a else os.path.expanduser(
+            f"~/edge-cache-monitor/{dt.datetime.now():%Y%m%d-%H%M}.csv")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        run(hours, out)
+    elif a[:1] == ["report"] and len(a) == 2:
+        print(report(a[1]), end="")
+    else:
+        sys.exit(__doc__)

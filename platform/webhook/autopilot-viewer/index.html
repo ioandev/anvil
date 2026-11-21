@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Autopilot runs</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%235b6cff'/%3E%3Cpath d='M9 17l5 5 9-11' stroke='white' stroke-width='3.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<!--
+  The autopilot's runs, served on the tailnet only (https://<the server's tailnet name>:8446, platform/webhook,
+  Deployment autopilot-viewer). Data: /cgi-bin/runs (every run's summary), /runs/<id>.md (the scrubbed transcript
+  the Mac uploads after each run), /state.json (the autopilot's live state). Everything in a transcript is untrusted
+  text (logs, pages, alert text): it is always escaped before it is shown, never interpreted as HTML.
+-->
+<style>
+:root {
+  --bg: #f6f7fb; --panel: #ffffff; --panel-2: #f1f3f9; --line: #e2e5ef; --text: #171a26; --muted: #646b82;
+  --faint: #9aa1b5; --accent: #5b6cff; --accent-soft: #e8ebff;
+  --ok: #12a150; --ok-soft: #e3f6eb; --warn: #c27a00; --warn-soft: #fdf1dc; --bad: #d93a3a; --bad-soft: #fde6e6;
+  --violet: #8a4fd6; --violet-soft: #f1e8fd; --code-bg: #0f1220; --code-text: #e3e6f3;
+  --shadow: 0 1px 2px rgba(20,24,40,.05), 0 4px 18px rgba(20,24,40,.06);
+  --radius: 14px; --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0c0e16; --panel: #141724; --panel-2: #1a1e2e; --line: #262b3f; --text: #e8eaf4; --muted: #9aa1b8;
+    --faint: #6b7290; --accent: #8a96ff; --accent-soft: #23284a;
+    --ok: #3ccf7c; --ok-soft: #12301f; --warn: #f0ae3c; --warn-soft: #33270f; --bad: #ff6b6b; --bad-soft: #3a1717;
+    --violet: #b98cff; --violet-soft: #2a1d42; --code-bg: #090b12; --code-text: #dfe3f2;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 22px rgba(0,0,0,.25);
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0c0e16; --panel: #141724; --panel-2: #1a1e2e; --line: #262b3f; --text: #e8eaf4; --muted: #9aa1b8;
+  --faint: #6b7290; --accent: #8a96ff; --accent-soft: #23284a;
+  --ok: #3ccf7c; --ok-soft: #12301f; --warn: #f0ae3c; --warn-soft: #33270f; --bad: #ff6b6b; --bad-soft: #3a1717;
+  --violet: #b98cff; --violet-soft: #2a1d42; --code-bg: #090b12; --code-text: #dfe3f2;
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 6px 22px rgba(0,0,0,.25);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 16px 64px; }
+header.top { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 14px; padding-top: 12px; padding-bottom: 12px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; color: var(--text); }
+.brand .logo { width: 28px; height: 28px; border-radius: 9px; background: linear-gradient(135deg, var(--accent), var(--violet));
+  display: grid; place-items: center; color: white; font-size: 15px; }
+.spacer { flex: 1; }
+.btn { border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 10px; padding: 6px 12px;
+  font: inherit; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { border-color: var(--accent); } .btn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 30px 0 12px; font-weight: 650; }
+.muted { color: var(--muted); } .faint { color: var(--faint); } .mono { font-family: var(--mono); font-size: 12.5px; }
+
+/* live status */
+.live { display: grid; grid-template-columns: minmax(260px, 1.3fr) repeat(4, minmax(130px, 1fr)); gap: 0; margin-top: 22px; overflow: hidden; }
+.live > div { padding: 18px 20px; border-left: 1px solid var(--line); }
+.live > div:first-child { border-left: 0; }
+.live .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.live .v { font-size: 22px; font-weight: 700; margin-top: 4px; }
+.live .s { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.state { display: flex; align-items: center; gap: 12px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.idle { background: var(--ok); box-shadow: 0 0 0 5px var(--ok-soft); }
+.dot.running { background: var(--accent); box-shadow: 0 0 0 5px var(--accent-soft); animation: pulse 1.4s infinite; }
+.dot.paused { background: var(--warn); box-shadow: 0 0 0 5px var(--warn-soft); }
+.dot.gave_up, .dot.stale { background: var(--bad); box-shadow: 0 0 0 5px var(--bad-soft); }
+@keyframes pulse { 50% { box-shadow: 0 0 0 9px transparent; } }
+.incident { margin-top: 12px; padding: 12px 16px; border-radius: 12px; background: var(--accent-soft); font-size: 14px; }
+
+/* kpis + charts */
+.kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+.kpi { padding: 14px 16px; }
+.kpi .v { font-size: 24px; font-weight: 750; letter-spacing: -.01em; }
+.kpi .k { font-size: 12.5px; color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; margin-top: 12px; }
+.chart { padding: 16px 18px; }
+.chart h3, .card h3 { margin: 0 0 10px; font-size: 14px; font-weight: 650; }
+.legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--muted); margin-bottom: 6px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+svg text { fill: var(--muted); font-size: 11px; }
+.bars .row { display: grid; grid-template-columns: minmax(120px, 210px) 1fr 34px; gap: 10px; align-items: center; font-size: 13px; margin: 5px 0; }
+.bars .row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bars .track { height: 8px; border-radius: 6px; background: var(--panel-2); overflow: hidden; }
+.bars .fill { height: 100%; border-radius: 6px; background: var(--accent); }
+.bars .n { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* filters + list */
+.filters { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.filters input, .filters select { font: inherit; font-size: 14px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--text); min-width: 0; }
+.filters input { flex: 1; min-width: 200px; }
+.runs { display: flex; flex-direction: column; gap: 10px; }
+.run { display: grid; grid-template-columns: 6px 1fr; overflow: hidden; cursor: pointer; transition: transform .08s, border-color .1s; color: var(--text); }
+.run:hover { border-color: var(--accent); text-decoration: none; }
+.run .bar { background: var(--faint); }
+.run .body { padding: 14px 18px; min-width: 0; }
+.run .line1 > * { min-width: 0; }
+.run .line1 { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.run .when { font-weight: 650; }
+.run .sum { margin-top: 6px; color: var(--text); font-size: 14px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.run .meta { margin-top: 8px; display: flex; gap: 16px; color: var(--muted); font-size: 12.5px; flex-wrap: wrap; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
+.r-fixed .bar { background: var(--ok); } .badge.fixed { background: var(--ok-soft); color: var(--ok); }
+.r-gave_up .bar { background: var(--warn); } .badge.gave_up { background: var(--warn-soft); color: var(--warn); }
+.r-error .bar { background: var(--bad); } .badge.error { background: var(--bad-soft); color: var(--bad); }
+.r-timeout .bar { background: var(--violet); } .badge.timeout { background: var(--violet-soft); color: var(--violet); }
+.badge.cleared { background: var(--accent-soft); color: var(--accent); } .r-cleared .bar { background: var(--accent); }
+.badge.repaired { background: var(--ok-soft); color: var(--ok); } .r-repaired .bar { background: var(--ok); }
+.chip { display: inline-block; font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); background: var(--panel-2);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip b { color: var(--text); font-weight: 600; }
+
+/* detail */
+.back { margin: 22px 0 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dhead { padding: 22px 24px; margin-top: 10px; }
+.dhead h1 { margin: 6px 0 4px; font-size: 24px; letter-spacing: -.01em; }
+.facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; margin-top: 16px; }
+.fact .k { font-size: 12px; color: var(--muted); } .fact .v { font-weight: 650; font-variant-numeric: tabular-nums; }
+.alerts { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.alert { font-family: var(--mono); font-size: 12.5px; padding: 8px 12px; border-radius: 10px; background: var(--panel-2); overflow-wrap: anywhere; }
+.alert b { font-family: system-ui, sans-serif; font-size: 13.5px; }
+.report { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.card { padding: 18px 20px; }
+.card.wide { grid-column: 1 / -1; }
+.card .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+.card ul { margin: 0; padding-left: 20px; }
+.steps { display: flex; gap: 0; margin: 18px 0 4px; flex-wrap: wrap; }
+.step { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; padding: 6px 14px 6px 10px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); margin: 0 8px 8px 0; }
+.step .n { width: 22px; height: 22px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; font-size: 12px; }
+.tools-bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; align-items: center; }
+.timeline { position: relative; margin-top: 8px; }
+.timeline::before { content: ""; position: absolute; left: 17px; top: 6px; bottom: 6px; width: 2px; background: var(--line); }
+.ev { position: relative; padding-left: 46px; margin: 10px 0; }
+.ev .ico { position: absolute; left: 4px; top: 10px; width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center;
+  font-size: 13px; font-weight: 700; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+.ev.tool .ico { color: var(--accent); }
+.ev.tool.err .ico { color: var(--bad); border-color: var(--bad); }
+.ev.claude .ico { background: linear-gradient(135deg, var(--accent), var(--violet)); color: white; border: 0; }
+.ev.phase { padding-left: 46px; margin: 22px 0 10px; }
+.ev.phase .ico { background: var(--text); color: var(--bg); border: 0; }
+.ev.phase .ptitle { font-weight: 750; font-size: 15px; padding-top: 12px; }
+.ev .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.ev .hd { display: flex; gap: 10px; align-items: baseline; padding: 10px 14px; cursor: pointer; flex-wrap: wrap; }
+.ev .hd .t { font-weight: 650; }
+.ev .hd .d { color: var(--muted); font-size: 13.5px; flex: 1; min-width: 160px; }
+.ev .hd .idx { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ev .cmd { margin: 0; padding: 10px 14px; background: var(--code-bg); color: var(--code-text); font: 12.5px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow: auto; }
+.ev .res { border-top: 1px solid var(--line); }
+.ev .res > .lbl { font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 8px 14px 0; }
+.ev.err .res > .lbl { color: var(--bad); }
+.ev .res pre { margin: 0; padding: 8px 14px 12px; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow: auto; color: var(--text); }
+.ev.collapsed .res pre { max-height: 0; padding-top: 0; padding-bottom: 0; overflow: hidden; }
+.ev.collapsed .res > .lbl::after { content: "  ·  click to show"; text-transform: none; letter-spacing: 0; font-weight: 500; color: var(--faint); }
+.ev .md { padding: 12px 16px; }
+.ev.thinking .box { background: var(--panel-2); border-style: dashed; }
+.ev.thinking .md { color: var(--muted); font-style: italic; }
+.ev.prompt .box { background: var(--panel-2); }
+.ev.hidden { display: none; }
+.md p { margin: 0 0 10px; } .md p:last-child { margin-bottom: 0; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+.md h1, .md h2, .md h3, .md h4 { font-size: 15px; margin: 12px 0 6px; text-transform: none; letter-spacing: 0; color: var(--text); }
+.md code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); padding: 1px 5px; border-radius: 5px; overflow-wrap: anywhere; }
+.md pre { background: var(--code-bg); color: var(--code-text); padding: 10px 12px; border-radius: 10px; overflow: auto; font: 12.5px/1.5 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.md pre code { background: none; padding: 0; color: inherit; }
+.endline { margin: 10px 0 10px 46px; font-size: 13px; color: var(--muted); }
+.session { position: relative; z-index: 1; margin: 26px 0 0 46px; padding: 12px 16px; border-radius: 12px; border: 1px solid var(--line); background: var(--panel-2); font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.session b { color: var(--text); }
+.empty { padding: 40px; text-align: center; color: var(--muted); }
+.loading { height: 3px; background: linear-gradient(90deg, var(--accent), var(--violet)); transform-origin: left; transition: transform .2s; }
+footer { margin-top: 40px; color: var(--faint); font-size: 12.5px; text-align: center; }
+mark { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 3px; }
+@media (max-width: 900px) {
+  .live { grid-template-columns: 1fr 1fr; } .live > div { border-left: 0; border-top: 1px solid var(--line); }
+  .live > div:first-child { grid-column: 1 / -1; border-top: 0; }
+  .kpis { grid-template-columns: repeat(3, 1fr); } .grid2, .report { grid-template-columns: 1fr; }
+}
+@media (max-width: 520px) { .kpis { grid-template-columns: repeat(2, 1fr); } .ev { padding-left: 38px; } .timeline::before { left: 13px; } .ev .ico { left: 0; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="loading" id="loading" style="transform: scaleX(0)"></div>
+  <div class="wrap">
+    <a class="brand" href="#"><span class="logo">✓</span>Autopilot</a>
+    <span class="muted" id="ver" style="font-size:13px"></span>
+    <span class="spacer"></span>
+    <button class="btn" id="theme" title="Light / dark">◐</button>
+  </div>
+</header>
+<main class="wrap" id="app"><div class="empty">Loading…</div></main>
+<footer class="wrap">anvil · tailnet only · transcripts are the scrubbed copies the Mac uploads (kept 90 days)</footer>
+
+<script>
+"use strict";
+// ---------- helpers ----------
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const RESULTS = { fixed: "Fixed", gave_up: "Gave up", error: "Error", timeout: "Timed out" };
+// What a run really did. The autopilot records "fixed" whenever the alert is gone by the end, also when it changed
+// nothing; its report's "actions" tell the two apart: repaired = fixed AND it changed something.
+const OUTCOMES = { repaired: "Repaired", cleared: "Cleared by itself", gave_up: "Gave up", error: "Error", timeout: "Timed out", fixed: "Fixed (loading…)" };
+const COLORS = { repaired: "var(--ok)", cleared: "var(--accent)", gave_up: "var(--warn)", error: "var(--bad)", timeout: "var(--violet)", fixed: "var(--faint)" };
+const outcome = r => r.meta.result !== "fixed" ? (r.meta.result || "error") : !r.t ? "fixed" : (r.t.report?.actions || []).length ? "repaired" : "cleared";
+const parseTime = s => { if (!s) return null; const m = /^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)Z$/.exec(s); return m ? new Date(Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6])) : new Date(s); };
+const fmtWhen = d => d ? d.toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "?";
+const fmtFull = d => d ? d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" }) : "?";
+const fmtDur = s => { if (s == null || isNaN(s)) return "?"; s = Math.round(s); if (s < 60) return s + " s"; const m = Math.floor(s / 60), r = s % 60; return m < 60 ? `${m} min ${r ? r + " s" : ""}`.trim() : `${Math.floor(m / 60)} h ${m % 60} min`; };
+const fmtAgo = s => s < 90 ? `${Math.round(s)} s ago` : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 172800 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} days ago`;
+const money = n => n == null ? "?" : "$" + n.toFixed(2);
+const alertName = a => String(a).split("{")[0];
+const alertLabels = a => { const m = /\{(.*)\}$/.exec(String(a)); return m ? m[1].split(",").map(x => x.split("=")).filter(x => x[0] !== "severity") : []; };
+
+
+// ---------- markdown (safe: everything is escaped first) ----------
+function inline(t) {
+  t = esc(t);
+  const codes = [];
+  t = t.replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0000${codes.length - 1}\u0000`; });
+  t = t.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").replace(/(^|[^*])\*([^*\s][^*]*)\*/g, "$1<i>$2</i>");
+  t = t.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_, a, h) => `<a href="${h}" target="_blank" rel="noopener noreferrer">${a}</a>`);
+  return t.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${codes[i]}</code>`);
+}
+function md(src) {
+  const out = [], lines = String(src).replace(/\s+$/, "").split("\n");
+  let i = 0, para = [], list = null;
+  const flush = () => { if (para.length) { out.push(`<p>${inline(para.join(" "))}</p>`); para = []; } if (list) { out.push(`<${list.t}>${list.items.map(x => `<li>${inline(x)}</li>`).join("")}</${list.t}>`); list = null; } };
+  while (i < lines.length) {
+    const l = lines[i];
+    const f = /^(`{3,})(\w*)\s*$/.exec(l);
+    if (f) { flush(); const buf = []; i++; while (i < lines.length && lines[i] !== f[1]) buf.push(lines[i++]); i++; out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`); continue; }
+    const h = /^(#{1,4})\s+(.*)$/.exec(l);
+    if (h) { flush(); out.push(`<h${h[1].length + 1}>${inline(h[2])}</h${h[1].length + 1}>`); i++; continue; }
+    const li = /^\s*(?:([-*])|(\d+)[.)])\s+(.*)$/.exec(l);
+    if (li) { if (para.length) { out.push(`<p>${inline(para.join(" "))}</p>`); para = []; } const t = li[1] ? "ul" : "ol"; if (!list || list.t !== t) { if (list) flush(); list = { t, items: [] }; } list.items.push(li[3]); i++; continue; }
+    if (list && /^\s{2,}\S/.test(l)) { list.items[list.items.length - 1] += " " + l.trim(); i++; continue; }
+    if (!l.trim()) { flush(); i++; continue; }
+    if (list) flush();
+    para.push(l); i++;
+  }
+  flush();
+  return out.join("");
+}
+
+// ---------- transcript parser ----------
+// The Mac writes: "## Session `id`", "model `m`, cwd `c`, tools: …", then "### Tool: Name (description)" + a fenced input,
+// "#### Result" / "#### Result (error)" + a fenced output, "### Claude", "### Claude (thinking)", "### Prompt" (a skill's
+// instructions), and "## End: <status>" + "turns N, S s, cost $C". Headings inside fences are content.
+function unfence(text) {
+  const ls = text.replace(/^\s*\n/, "").replace(/\s+$/, "").split("\n");
+  const m = ls.length ? /^(`{3,})(\w*)\s*$/.exec(ls[0]) : null;
+  if (m && ls.length >= 2 && ls[ls.length - 1] === m[1]) return { lang: m[2], text: ls.slice(1, -1).join("\n") };
+  return { lang: "", text: ls.join("\n") };
+}
+function parseTranscript(src) {
+  // Parallel tool calls are written as call, call, result, result: each result belongs to the oldest call still
+  // waiting for one (pending), not to the latest event.
+  const sessions = []; let s = null, ev = null, target = null, fence = null, expectEnd = false, pending = [];
+  const newSession = id => { s = { id, model: "", tools: "", events: [], end: null }; sessions.push(s); ev = null; target = null; pending = []; };
+  const push = e => { if (!s) newSession("?"); s.events.push(e); ev = e; target = e.lines = []; };
+  for (const line of src.split("\n")) {
+    if (fence) { if (line === fence) fence = null; if (target) target.push(line); continue; }
+    const f = /^(`{3,})\w*\s*$/.exec(line);
+    if (f) { fence = f[1]; if (target) target.push(line); continue; }
+    let m;
+    if ((m = /^## Session `([^`]*)`/.exec(line))) { newSession(m[1]); continue; }
+    if (s && !s.model && (m = /^model `([^`]*)`(?:, cwd `[^`]*`)?(?:, tools: (.*))?$/.exec(line))) { s.model = m[1]; s.tools = m[2] || ""; continue; }
+    if ((m = /^### Tool: (\S+)(?: \((.*)\))?\s*$/.exec(line))) { push({ type: "tool", name: m[1], desc: m[2] || "" }); ev.inLines = ev.lines; pending.push(ev); continue; }
+    if ((m = /^#### Result( \(error\))?\s*$/.exec(line)) && pending.length) { const t = pending.shift(); t.error = !!m[1]; t.resLines = target = []; continue; }
+    if (/^### Claude \(thinking\)\s*$/.test(line)) { push({ type: "thinking" }); continue; }
+    if (/^### Claude\s*$/.test(line)) { push({ type: "claude" }); continue; }
+    if (/^### Prompt\s*$/.test(line)) { push({ type: "prompt" }); continue; }
+    if ((m = /^## End: (.*)$/.exec(line))) { if (!s) newSession("?"); s.end = { status: m[1] }; ev = null; target = null; expectEnd = true; continue; }
+    if (expectEnd && (m = /turns (\d+), ([\d.]+) s, cost \$([\d.]+)/.exec(line))) { s.end.turns = +m[1]; s.end.secs = +m[2]; s.end.cost = +m[3]; expectEnd = false; continue; }
+    if (target) target.push(line);
+  }
+  let report = null, tools = 0, errors = 0, cost = 0, turns = 0, secs = 0; const skills = [], byTool = {};
+  for (const se of sessions) {
+    if (se.end) { cost += se.end.cost || 0; turns += se.end.turns || 0; secs += se.end.secs || 0; }
+    for (const e of se.events) {
+      if (e.type === "tool") {
+        tools++; if (e.error) errors++; byTool[e.name] = (byTool[e.name] || 0) + 1;
+        e.input = unfence((e.inLines || []).join("\n")); e.result = e.resLines ? unfence(e.resLines.join("\n")) : null;
+        if (e.name === "Skill") { try { e.skill = JSON.parse(e.input.text).skill; } catch { e.skill = (/"skill"\s*:\s*"([^"]+)"/.exec(e.input.text) || [])[1]; } if (e.skill) skills.push(e.skill); }
+        if (e.input.lang === "json") { try { e.args = JSON.parse(e.input.text); } catch {} }
+      } else {
+        e.text = e.lines.join("\n").trim();
+        if (e.type === "thinking") e.text = unfence(e.text).text;   // written fenced; it's prose
+        if (e.type === "prompt") { const u = unfence(e.text); e.text = u.text; const k = /^Base directory for this skill: .*\/skills\/([\w.-]+)/m.exec(u.text); e.skill = k ? k[1] : ""; }
+        if (e.type === "claude") {
+          const blocks = [...e.text.matchAll(/```json\s*\n([\s\S]*?)\n```/g)];
+          for (const b of blocks.reverse()) { try { const j = JSON.parse(b[1]); if (j && typeof j === "object" && ("summary" in j || "fixed" in j)) { report = j; e.reportBlock = b[0]; break; } } catch {} }
+        }
+      }
+    }
+  }
+  return { sessions, report, stats: { tools, errors, cost, turns, secs, skills, byTool } };
+}
+
+// ---------- data ----------
+const cache = new Map();
+let RUNS = [], STATE = null, loaded = 0;
+async function getJSON(u) { const r = await fetch(u, { cache: "no-store" }); if (!r.ok) throw new Error(u + ": " + r.status); return r.json(); }
+async function transcript(id) {
+  if (cache.has(id)) return cache.get(id);
+  const p = fetch(`runs/${encodeURIComponent(id)}.md`, { cache: "force-cache" }).then(r => r.ok ? r.text() : "").then(t => parseTranscript(t));
+  cache.set(id, p); return p;
+}
+async function loadAll() {
+  const q = RUNS.slice(); let n = 0;
+  const bar = $("#loading");
+  const worker = async () => { while (q.length) { const r = q.shift(); try { r.t = await transcript(r.id); } catch { r.t = null; } n++; bar.style.transform = `scaleX(${n / RUNS.length})`; if (n % 8 === 0 || n === RUNS.length) refreshList(); } };
+  await Promise.all(Array.from({ length: 6 }, worker));
+  setTimeout(() => { bar.style.transform = "scaleX(0)"; }, 400);
+  refreshList();
+}
+
+// ---------- live status ----------
+function liveHTML() {
+  const st = STATE || {}, now = Date.now() / 1000;
+  const age = st.received ? now - st.received : null;
+  let state = st.state || "unknown", label = { idle: "Watching", running: "Working on an incident", gave_up: "Gave up: needs you", paused: "Paused" }[state] || state;
+  let sub = st.since ? `since ${fmtWhen(new Date(st.since))}` : "";
+  const pu = st.paused_until ? new Date(st.paused_until) : null;
+  if (state === "paused" && pu) sub = pu > Date.now() ? `resumes by itself in ${fmtDur((pu - Date.now()) / 1000)} (${pu.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })})` : "pause has ended: resuming within seconds";
+  let dot = state;
+  if (age != null && age > 600) { dot = "stale"; label = "Mac not reporting"; sub = `last heartbeat ${fmtAgo(age)}: the autopilot isn't running`; }
+  const lr = st.last_run || {};
+  const inc = st.incident ? `<div class="incident"><b>Current incident:</b> ${esc(typeof st.incident === "string" ? st.incident : JSON.stringify(st.incident))}</div>` : "";
+  return `<div class="panel live">
+    <div><div class="k">Autopilot</div><div class="state" style="margin-top:6px"><span class="dot ${esc(dot)}"></span><div><div class="v" style="margin:0">${esc(label)}</div><div class="s">${esc(sub)}</div></div></div></div>
+    <div><div class="k">Mac heartbeat</div><div class="v">${age == null ? "?" : esc(fmtAgo(age))}</div><div class="s">every 15 s when healthy</div></div>
+    <div><div class="k">Runs today</div><div class="v">${esc(st.runs_today ?? "?")}<span class="muted" style="font-size:15px"> / ${esc(st.max_runs_per_day ?? "?")}</span></div><div class="s">${esc(st.runs_total ?? "?")} in total</div></div>
+    <div><div class="k">Last run</div><div class="v"><span class="badge ${esc(lr.result || "")}">${esc(RESULTS[lr.result] || lr.result || "none")}</span></div><div class="s">${lr.finished ? esc(fmtAgo(now - new Date(lr.finished) / 1000)) : ""}</div></div>
+    <div><div class="k">Version</div><div class="v mono" style="font-size:14px;margin-top:9px">${esc(st.version || "?")}</div><div class="s">pause/resume: status site /autopilot</div></div>
+  </div>${inc}`;
+}
+
+// ---------- overview ----------
+let filt = { q: "", result: "", alert: "" };
+function filtered() {
+  const q = filt.q.toLowerCase();
+  return RUNS.filter(r => (!filt.result || outcome(r) === filt.result)
+    && (!filt.alert || (r.meta.alerts || []).some(a => alertName(a) === filt.alert))
+    && (!q || [r.id, r.meta.summary, ...(r.meta.alerts || []), r.t?.report?.cause, ...(r.t?.report?.actions || []).map(a => typeof a === "string" ? a : JSON.stringify(a))].join(" ").toLowerCase().includes(q)));
+}
+function kpis() {
+  const n = RUNS.length, by = o => RUNS.filter(x => outcome(x) === o).length;
+  const withT = RUNS.filter(r => r.t), cost = withT.reduce((a, r) => a + r.t.stats.cost, 0), tools = withT.reduce((a, r) => a + r.t.stats.tools, 0);
+  const durs = RUNS.map(r => (new Date(r.meta.finished) - new Date(r.meta.started)) / 1000).filter(x => x > 0).sort((a, b) => a - b);
+  const med = durs.length ? durs[Math.floor(durs.length / 2)] : null;
+  const k = (v, l) => `<div class="panel kpi"><div class="v">${v}</div><div class="k">${l}</div></div>`;
+  const pend = by("fixed");
+  return `<div class="kpis">${k(n, "runs recorded")}${k(`<span style="color:var(--ok)">${by("repaired")}</span>`, `repaired: it changed something${pend ? ` (${pend} still loading)` : ""}`)}${k(`<span style="color:var(--accent)">${by("cleared")}</span>`, "cleared by themselves (no changes)")}${k(`<span style="color:var(--warn)">${by("gave_up")}</span>`, "gave up (needed you)")}${k(`<span style="color:var(--bad)">${by("error") + by("timeout")}</span>`, `errors / timeouts · median run ${esc(fmtDur(med))}`)}${k(money(cost), `Claude usage · ${tools} tool calls`)}</div>`;
+}
+function dayChart() {
+  if (!RUNS.length) return "";
+  const days = {}; const key = d => d.toISOString().slice(0, 10);
+  const first = parseTime(RUNS[RUNS.length - 1].id), last = new Date();
+  const ORDER = ["repaired", "cleared", "fixed", "gave_up", "error", "timeout"];
+  for (let d = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth(), first.getUTCDate())); d <= last; d = new Date(d.getTime() + 864e5)) days[key(d)] = Object.fromEntries(ORDER.map(o => [o, 0]));
+  for (const r of RUNS) { const k = key(parseTime(r.id)); const o = outcome(r); if (days[k]) days[k][o in days[k] ? o : "error"]++; }
+  const ks = Object.keys(days), max = Math.max(1, ...ks.map(k => Object.values(days[k]).reduce((a, b) => a + b, 0)));
+  const W = 720, H = 170, pad = 22, bw = Math.max(4, (W - pad) / ks.length - 4);
+  let bars = "";
+  ks.forEach((k, i) => {
+    let y = H - pad; const x = pad + i * ((W - pad) / ks.length) + 2;
+    for (const r of ORDER) { const h = days[k][r] / max * (H - pad - 10); if (h) { bars += `<rect x="${x}" y="${y - h}" width="${bw}" height="${h}" rx="3" style="fill:${COLORS[r]}"><title>${k}: ${days[k][r]} ${OUTCOMES[r]}</title></rect>`; y -= h + 1; } }
+    if (ks.length <= 20 || i % Math.ceil(ks.length / 14) === 0) bars += `<text x="${x + bw / 2}" y="${H - 6}" text-anchor="middle">${k.slice(8)}/${k.slice(5, 7)}</text>`;
+  });
+  const grid = [0, .5, 1].map(f => { const y = H - pad - f * (H - pad - 10); return `<line x1="${pad}" x2="${W}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${pad - 6}" y="${y + 4}" text-anchor="end">${Math.round(f * max)}</text>`; }).join("");
+  return `<div class="panel chart"><h3>Runs per day</h3><div class="legend">${["repaired", "cleared", "gave_up", "error"].map(r => `<span><i style="background:${COLORS[r]}"></i>${OUTCOMES[r]}</span>`).join("")}</div>
+    <svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="Runs per day">${grid}${bars}</svg></div>`;
+}
+function topAlerts() {
+  const c = {}; for (const r of RUNS) for (const a of new Set((r.meta.alerts || []).map(alertName))) c[a] = (c[a] || 0) + 1;
+  const e = Object.entries(c).sort((a, b) => b[1] - a[1]).slice(0, 8), max = e.length ? e[0][1] : 1;
+  return `<div class="panel chart"><h3>What woke it up</h3><div class="bars">${e.map(([k, v]) => `<div class="row"><span class="name" title="${esc(k)}">${esc(k)}</span><span class="track"><span class="fill" style="display:block;width:${100 * v / max}%"></span></span><span class="n">${v}</span></div>`).join("") || '<div class="muted">none</div>'}</div></div>`;
+}
+function runCard(r) {
+  const t = r.t, st = t?.stats, d = (new Date(r.meta.finished) - new Date(r.meta.started)) / 1000;
+  const res = outcome(r);
+  const alerts = (r.meta.alerts || []).map(a => { const l = alertLabels(a).filter(x => /namespace|pod|instance|service|deployment|job_name|alertname/.test(x[0])).map(x => x[1]).slice(0, 2).join(" · "); return `<span class="chip"><b>${esc(alertName(a))}</b>${l ? " · " + esc(l) : ""}</span>`; }).join(" ");
+  const acts = t?.report?.actions?.length ? `<span>⚙ ${t.report.actions.length} action${t.report.actions.length > 1 ? "s" : ""}</span>` : (t ? "<span>no changes made</span>" : "");
+  return `<a class="panel run r-${esc(res)}" href="#run=${encodeURIComponent(r.id)}"><div class="bar"></div><div class="body">
+    <div class="line1"><span class="when">${esc(fmtWhen(parseTime(r.id)))}</span><span class="badge ${esc(res)}">${esc(OUTCOMES[res] || res)}</span>${alerts}</div>
+    <div class="sum">${esc(t?.report?.summary || r.meta.summary || "(no summary)")}</div>
+    <div class="meta"><span>⏱ ${esc(fmtDur(d))}</span>${st ? `<span>🔧 ${st.tools} tool calls${st.errors ? ` · <span style="color:var(--bad)">${st.errors} failed</span>` : ""}</span><span>${esc(st.skills.join(" → ") || "")}</span><span>${money(st.cost)}</span>` : '<span class="faint">loading details…</span>'}${acts}</div>
+  </div></a>`;
+}
+function refreshList() {
+  if (location.hash.startsWith("#run=")) return;
+  const el = $("#runs"); if (!el) return;
+  const f = filtered();
+  el.innerHTML = f.length ? f.map(runCard).join("") : '<div class="panel empty">No runs match.</div>';
+  $("#count").textContent = `${f.length} of ${RUNS.length}`;
+  const k = $("#kpis"); if (k) k.innerHTML = kpis();
+  const c = $("#charts"); if (c) c.innerHTML = dayChart() + topAlerts();
+}
+function overview() {
+  const names = [...new Set(RUNS.flatMap(r => (r.meta.alerts || []).map(alertName)))].sort();
+  $("#app").innerHTML = `${liveHTML()}
+    <h2>All runs</h2><div id="kpis">${kpis()}</div>
+    <div class="grid2" id="charts">${dayChart()}${topAlerts()}</div>
+    <h2>Runs <span class="faint" id="count"></span></h2>
+    <div class="filters">
+      <input id="q" type="search" placeholder="Search summaries, alerts, causes, actions…" value="${esc(filt.q)}">
+      <select id="fres"><option value="">Every outcome</option>${["repaired", "cleared", "gave_up", "error", "timeout"].map(k => `<option value="${k}" ${filt.result === k ? "selected" : ""}>${OUTCOMES[k]}</option>`).join("")}</select>
+      <select id="falert"><option value="">Every alert</option>${names.map(n => `<option ${filt.alert === n ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>
+    </div>
+    <div class="runs" id="runs"></div>`;
+  $("#q").oninput = e => { filt.q = e.target.value; refreshList(); };
+  $("#fres").onchange = e => { filt.result = e.target.value; refreshList(); };
+  $("#falert").onchange = e => { filt.alert = e.target.value; refreshList(); };
+  refreshList();
+}
+
+// ---------- one run ----------
+const ICON = { Bash: "$", Read: "📄", Skill: "★", WebSearch: "🔍", WebFetch: "🌐", Edit: "✎", Write: "✎", Task: "⇉" };
+function toolBody(e) {
+  const a = e.args;
+  if (e.name === "Bash" || e.input.lang === "sh") return `<pre class="cmd">${esc(e.input.text)}</pre>`;
+  if (a && e.name === "Read") return `<pre class="cmd">${esc(a.file_path || "")}${a.offset ? `  (from line ${esc(a.offset)})` : ""}</pre>`;
+  if (a && e.name === "Skill") return "";
+  if (a && e.name === "WebSearch") return `<pre class="cmd">${esc(a.query || JSON.stringify(a, null, 1))}</pre>`;
+  return e.input.text ? `<pre class="cmd">${esc(e.input.text)}</pre>` : "";
+}
+function reportCards(rep, meta) {
+  if (!rep) return `<div class="report"><div class="panel card wide"><h3>Summary</h3><div class="txt">${esc(meta.summary || "(none)")}</div><p class="muted" style="margin-bottom:0">No structured report in this transcript.</p></div></div>`;
+  const list = v => Array.isArray(v) ? (v.length ? `<ul>${v.map(x => `<li>${typeof x === "string" ? inline(x) : `<code>${esc(JSON.stringify(x))}</code>`}</li>`).join("")}</ul>` : '<span class="muted">none: nothing was changed</span>') : `<div class="txt">${inline(String(v ?? ""))}</div>`;
+  const known = ["summary", "cause", "actions", "fixed", "unreleased_changes", "next_time"];
+  const extra = Object.keys(rep).filter(k => !known.includes(k));
+  return `<div class="report">
+    <div class="panel card wide"><h3>What happened ${rep.fixed === false ? '<span class="badge gave_up">not fixed</span>' : (rep.actions || []).length ? '<span class="badge repaired">repaired</span>' : '<span class="badge cleared">cleared by itself</span>'}</h3><div class="txt">${inline(rep.summary || meta.summary || "")}</div></div>
+    <div class="panel card"><h3>Cause</h3><div class="txt">${inline(rep.cause || "—")}</div></div>
+    <div class="panel card"><h3>Actions taken</h3>${list(rep.actions || [])}</div>
+    ${rep.unreleased_changes ? `<div class="panel card"><h3>Unreleased changes (repo vs live)</h3><div class="txt">${inline(rep.unreleased_changes)}</div></div>` : ""}
+    ${rep.next_time ? `<div class="panel card"><h3>Next time / for the owner</h3><div class="txt">${inline(rep.next_time)}</div></div>` : ""}
+    ${extra.map(k => `<div class="panel card"><h3>${esc(k)}</h3>${list(rep[k])}</div>`).join("")}
+  </div>`;
+}
+let view = { thinking: true, prompts: false, expand: false };
+async function detail(id) {
+  const r = RUNS.find(x => x.id === id);
+  if (!r) { $("#app").innerHTML = `<div class="back"><a class="btn" href="#">← All runs</a></div><div class="panel empty">No run ${esc(id)}.</div>`; return; }
+  $("#app").innerHTML = `<div class="back"><a class="btn" href="#">← All runs</a></div><div class="panel empty">Loading the transcript…</div>`;
+  const t = await transcript(id); r.t = t;
+  const i = RUNS.indexOf(r), prev = RUNS[i + 1], next = RUNS[i - 1];
+  const st = t.stats, res = outcome(r);
+  const started = new Date(r.meta.started), finished = new Date(r.meta.finished);
+  const models = [...new Set(t.sessions.map(s => s.model).filter(Boolean))].join(", ");
+  let n = 0, html = "";
+  t.sessions.forEach((s, si) => {
+    if (t.sessions.length > 1 || s.tools) html += `<div class="session"><b>Session ${si + 1}</b> · ${esc(s.model)} · <span class="mono">${esc(s.id)}</span>${s.tools ? `<br>tools available: ${esc(s.tools)}` : ""}</div>`;
+    for (const e of s.events) {
+      if (e.type === "tool" && e.name === "Skill") {
+        html += `<div class="ev phase"><span class="ico">★</span><div class="ptitle">Skill: ${esc(e.skill || "?")}</div></div>`; continue;
+      }
+      if (e.type === "tool") {
+        n++;
+        const res = e.result ? e.result.text : "";
+        const long = res.split("\n").length > 14;
+        html += `<div class="ev tool ${e.error ? "err" : ""} ${long && !e.error && !view.expand ? "collapsed" : ""}" data-search="${esc((e.desc + " " + e.input.text + " " + res).toLowerCase())}">
+          <span class="ico">${ICON[e.name] || "•"}</span><div class="box">
+          <div class="hd"><span class="t">${esc(e.name)}</span><span class="d">${esc(e.desc)}</span><span class="idx">#${n}</span></div>
+          ${toolBody(e)}
+          ${e.result ? `<div class="res"><div class="lbl">${e.error ? "Error" : "Result"} · ${res.split("\n").length} line${res.split("\n").length > 1 ? "s" : ""}</div><pre>${esc(res || "(empty)")}</pre></div>` : `<div class="res"><div class="lbl">No result recorded</div></div>`}
+          </div></div>`;
+      } else if (e.type === "claude") {
+        const text = e.reportBlock ? e.text.replace(e.reportBlock, "").trim() : e.text;
+        if (text) html += `<div class="ev claude"><span class="ico">C</span><div class="box"><div class="md">${md(text)}</div></div></div>`;
+        if (e.reportBlock) html += `<div class="ev claude"><span class="ico">{}</span><div class="box"><div class="hd"><span class="t">Final report (JSON)</span><span class="d">parsed into the cards above</span></div><pre class="cmd">${esc(JSON.stringify(t.report, null, 2))}</pre></div></div>`;
+      } else if (e.type === "thinking") {
+        if (e.text) html += `<div class="ev thinking ${view.thinking ? "" : "hidden"}"><span class="ico">…</span><div class="box"><div class="md">${md(e.text)}</div></div></div>`;
+      } else if (e.type === "prompt") {
+        html += `<div class="ev prompt ${view.prompts ? "" : "hidden"}"><span class="ico">¶</span><div class="box"><div class="hd"><span class="t">Instructions given</span><span class="d">${esc(e.skill ? "skill " + e.skill : "")}</span></div><div class="md">${md(e.text)}</div></div></div>`;
+      }
+    }
+    if (s.end) html += `<div class="endline">■ Session ended: <b>${esc(s.end.status)}</b>${s.end.turns != null ? ` · ${s.end.turns} turns · ${fmtDur(s.end.secs)} · ${money(s.end.cost)}` : ""}</div>`;
+  });
+  const alerts = (r.meta.alerts || []).map(a => `<div class="alert"><b>${esc(alertName(a))}</b>  ${alertLabels(a).map(([k, v]) => `${esc(k)}=<b>${esc(v)}</b>`).join("  ")}</div>`).join("");
+  const toolCounts = Object.entries(st.byTool).map(([k, v]) => `${v} ${k}`).join(" · ");
+  $("#app").innerHTML = `
+    <div class="back"><a class="btn" href="#">← All runs</a>${prev ? `<a class="btn" href="#run=${encodeURIComponent(prev.id)}">‹ Older</a>` : ""}${next ? `<a class="btn" href="#run=${encodeURIComponent(next.id)}">Newer ›</a>` : ""}<span class="spacer"></span><a class="btn" href="runs/${encodeURIComponent(id)}.md" target="_blank" rel="noopener">Raw transcript</a></div>
+    <div class="panel dhead">
+      <span class="badge ${esc(res)}">${esc(OUTCOMES[res] || res)}</span> <span class="faint" style="font-size:12.5px">recorded by the autopilot as "${esc(r.meta.result)}"</span>
+      <h1>${esc(fmtFull(started))}</h1>
+      <div class="muted mono">run ${esc(id)}</div>
+      <div class="facts">
+        <div class="fact"><div class="k">Duration</div><div class="v">${esc(fmtDur((finished - started) / 1000))}</div></div>
+        <div class="fact"><div class="k">Finished</div><div class="v">${esc(finished.toLocaleTimeString())}</div></div>
+        <div class="fact"><div class="k">Tool calls</div><div class="v">${st.tools}${st.errors ? ` <span style="color:var(--bad)">(${st.errors} failed)</span>` : ""}</div></div>
+        <div class="fact"><div class="k">Turns</div><div class="v">${st.turns || "?"}</div></div>
+        <div class="fact"><div class="k">Claude usage</div><div class="v">${money(st.cost)}</div></div>
+        <div class="fact"><div class="k">Model</div><div class="v">${esc(models || "?")}</div></div>
+      </div>
+      <div class="alerts">${alerts || '<div class="muted">no alerts recorded</div>'}</div>
+    </div>
+    ${reportCards(t.report, r.meta)}
+    <h2>How it went</h2>
+    <div class="steps">${(st.skills.length ? st.skills : ["(no skills)"]).map((s, i) => `<span class="step"><span class="n">${i + 1}</span>${esc(s)}</span>`).join("")}</div>
+    <div class="muted" style="font-size:13px">${esc(toolCounts)}</div>
+    <div class="tools-bar">
+      <button class="btn ${view.thinking ? "on" : ""}" id="tThink">Thinking</button>
+      <button class="btn ${view.prompts ? "on" : ""}" id="tPrompt">Skill instructions</button>
+      <button class="btn ${view.expand ? "on" : ""}" id="tExpand">Expand every result</button>
+      <span class="spacer"></span>
+      <input id="fq" type="search" placeholder="Find in this run…" style="font:inherit;font-size:14px;padding:7px 12px;border-radius:10px;border:1px solid var(--line);background:var(--panel);color:var(--text);min-width:200px">
+    </div>
+    <div class="timeline">${html || '<div class="panel empty">This transcript is empty.</div>'}</div>`;
+  document.querySelectorAll(".ev.tool .hd, .ev.tool .res .lbl").forEach(h => h.onclick = () => h.closest(".ev").classList.toggle("collapsed"));
+  $("#tThink").onclick = () => { view.thinking = !view.thinking; detail(id); };
+  $("#tPrompt").onclick = () => { view.prompts = !view.prompts; detail(id); };
+  $("#tExpand").onclick = () => { view.expand = !view.expand; detail(id); };
+  $("#fq").oninput = e => { const q = e.target.value.toLowerCase(); document.querySelectorAll(".ev.tool").forEach(ev => { ev.style.opacity = !q || ev.dataset.search.includes(q) ? "" : ".25"; if (q && ev.dataset.search.includes(q)) ev.classList.remove("collapsed"); }); };
+}
+
+// ---------- routing, theme, refresh ----------
+function route() { const m = /^#run=(.+)$/.exec(location.hash); if (m) detail(decodeURIComponent(m[1])); else overview(); window.scrollTo(0, 0); }
+window.addEventListener("hashchange", route);
+(() => { let t = null; try { t = localStorage.getItem("theme"); } catch {} if (t) document.documentElement.dataset.theme = t; })();
+$("#theme").onclick = () => {
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches, cur = document.documentElement.dataset.theme || (dark ? "dark" : "light");
+  const nx = cur === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = nx; try { localStorage.setItem("theme", nx); } catch {}
+};
+async function refreshState() {
+  try { STATE = await getJSON("state.json"); $("#ver").textContent = STATE.version ? "· " + STATE.version : ""; } catch { STATE = null; }
+  const live = document.querySelector(".live"); if (live) live.outerHTML = liveHTML();
+}
+(async () => {
+  try { [RUNS, STATE] = await Promise.all([getJSON("cgi-bin/runs"), getJSON("state.json").catch(() => null)]); }
+  catch (e) { $("#app").innerHTML = `<div class="panel empty">Couldn't load the runs: ${esc(e.message)}</div>`; return; }
+  if (STATE?.version) $("#ver").textContent = "· " + STATE.version;
+  RUNS.sort((a, b) => b.id.localeCompare(a.id));
+  route();
+  loadAll();
+  setInterval(refreshState, 15000);
+  setInterval(async () => { try { const n = await getJSON("cgi-bin/runs"); if (n.length !== RUNS.length) { const old = new Map(RUNS.map(r => [r.id, r])); RUNS = n.sort((a, b) => b.id.localeCompare(a.id)).map(r => old.get(r.id) || r); loadAll(); } } catch {} }, 60000);
+})();
+</script>
+</body>
+</html>

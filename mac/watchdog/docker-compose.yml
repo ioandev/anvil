@@ -1,0 +1,31 @@
+# The Mac mini's watchdog for ${ANVIL_NAME} (twilio-webhook in watchdog mode; source /repos/twilio-webhook).
+# Every minute it GETs WATCH_URL (the server's /watchdog). It phones you (Twilio) when:
+#   - ${ANVIL_NAME} doesn't answer for 10 minutes (crashed, out of memory, network or Scaleway outage), or
+#   - ${ANVIL_NAME} answers that its own alerting is dead (no Alertmanager heartbeat for 2 hours).
+# Muting: a silence on "Watchdog" in Alertmanager (https://${ANVIL_TAILNET_HOST}:8443) mutes this too, until it
+# ends, even if ${ANVIL_NAME} then becomes unreachable. It only pulls: nothing on ${ANVIL_NAME} has to reach the Mac.
+# No source here: the image is built on the Linux machine and loaded with `docker load` (README.md).
+services:
+  ${ANVIL_NAME}-watchdog:
+    image: ${ANVIL_REGISTRY}/twilio-alert:${ANVIL_TWILIO_TAG}   # loaded by scripts/home-deploy (podman save | docker load), never pulled here
+    pull_policy: never
+    container_name: ${ANVIL_NAME}-watchdog
+    restart: unless-stopped
+    env_file: .env                      # secrets (Twilio, the password, WATCH_URL)
+    environment:
+      # Call timings (same as the server's twilio-alert except the first call: ${ANVIL_NAME} being down can't wait):
+      # no calls 03:00-07:00 UK time (a call due then waits until 07:00), hourly repeats, answering pauses 60 min.
+      QUIET_HOURS: "${ANVIL_QUIET_HOURS}"
+      QUIET_TIMEZONE: "${ANVIL_TIMEZONE}"
+      CALL_SCHEDULE_MINUTES: "0,2,4,6,10,15,20,30,45,60"
+      CALL_REPEAT_MINUTES: "60"
+      ACK_SNOOZE_MINUTES: "60"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # Only to look at it from the Mac itself: curl "http://127.0.0.1:3017/watchdog?password=…"
+    ports: ["127.0.0.1:${ANVIL_HOME_WATCHDOG_PORT}:3000"]   # loopback only; another platform on the same machine needs its own
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }

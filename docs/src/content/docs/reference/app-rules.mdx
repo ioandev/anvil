@@ -1,0 +1,118 @@
+---
+title: Rules for every app
+description: The 19 rules every workload on anvil follows (CLAUDE.md), each with the reason it exists. scripts/sites.py check enforces the ones it can.
+---
+
+These are the rules in anvil's `CLAUDE.md`, which every Claude Code session (and every person) follows for every
+project, existing and new. `scripts/new-site init` writes a manifest from `scripts/templates/app.yaml.tpl` that
+already follows them, and `python3 -I scripts/sites.py check` (also `make check` and the pre-commit hook) enforces
+rules 2, 3, 5, 11, 13, 17 (partly), 19 (a warning) and the hosts. Each rule came from something that went wrong on the server anvil
+grew out of: see [Lessons learned](/lessons/).
+
+## 1. One namespace per project
+
+`apps/<ns>/app.yaml` holds the Namespace and everything in it; the project has an entry in `sites.yaml`. Start new
+ones with `scripts/new-site init` (it writes both).
+
+## 2. Unique, project-prefixed Service names
+
+Service names are in-cluster hostnames: `shop-api`, never `api`, `web`, `db`, `redis`, `backend`. Namespaces keep DNS
+separate, but a generic name only works by luck of the topology: on the original server a generic `backend:4000`
+round-robined across three projects' stacks. Call another namespace by its full name (`atlas-mariadb.atlas.svc`).
+
+## 3. Own numeric UID/GID per container, never reused
+
+From the namespace's block in `sites.yaml` (`uids:`; a new project takes `next_uid_block`: the platform has the
+5000s, projects start at 6000). Set `runAsUser`/`runAsGroup` (plus `fsGroup` with a volume) explicitly, even when the
+image has a `USER`: image defaults like 999 collide. Retired UIDs go in `retired_uids` and are never reused.
+
+## 4. One shared MariaDB; two users per project
+
+Each project gets its own database in `atlas` and exactly two users limited to it (`<ns>_rw` for the app, `<ns>_ro`
+read-only). Never root, never another project's user. See [Data & backups](/components/data/).
+
+## 5. `enableServiceLinks: false` on every pod
+
+Otherwise Kubernetes injects `X_PORT=tcp://…` variables that clobber the app's own settings. This crashed an app once.
+
+## 6. Bots, cron jobs and workers are singletons
+
+`strategy: Recreate`, one replica. Two copies means two Discord gateway sessions on one token, or duplicate emails.
+
+## 7. Client IP
+
+Behind Cloudflare → ServiceLB → Traefik, use `CF-Connecting-IP`. Never the left-most `X-Forwarded-For` entry
+(client-forgeable) or `X-Real-Ip` (internal).
+
+## 8. Secrets
+
+Never in `app.yaml` or any tracked plaintext file. App secrets live in `apps/<ns>/prod.env` (gitignored, encrypted twin
+`prod.env.sops`) and become the Secret `<ns>`; `make-secrets.py` builds it. See [Secrets](/components/secrets/).
+
+## 9. Ingress
+
+`ingressClassName: traefik`, entrypoint `websecure`, `tls.hosts`, **no `certresolver`** (TLS comes from Cloudflare
+Origin CA certs in Traefik's default TLSStore). A new domain needs its Cloudflare zone active **and its edge
+certificate issued** before the DNS cutover ([Edge](/components/edge/#moving-a-domain-onto-the-platform)).
+
+## 10. `www` redirects
+
+A site's apex in its `www:` list gets `www.<apex>` → `https://<apex>/<path>` (301), one shared route.
+
+## 11. Everything restarts, forever
+
+Deployments/StatefulSets only; every HTTP service has a readinessProbe and a livenessProbe on an endpoint that really
+answers (`initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5`: a restart after
+2.5 minutes of silence, generous so slow starts aren't killed). k3s restarts forever (a systemd drop-in in Butane).
+The template's readiness probe is a **port check**, so a pod that is merely busy is never taken out of service, and
+`preStop` uses Kubernetes' built-in `sleep` action (minimal images have no `sleep` binary). Before a launch, read
+`CAPACITY.md` in the repo.
+
+## 12. Throwaway things start with `zz-`
+
+Test namespaces, Deployments and Jobs are named `zz-…`, live in their own `zz-…` namespace and are deleted the same
+session. Grafana hides `zz-.*` by default; **alerts still see them**: delete within 10 minutes or you get called.
+
+## 13. Watched before it counts as deployed
+
+A probe URL in `sites.yaml` (`probes:`) for **each part that can fail on its own** (site, API health route, websocket
+service), then `make-secrets.py` and `node.sh deploy alerting`. Check `/cluster` is 200. Workloads without a URL are
+covered by kube-state-metrics.
+
+## 14. Every referenced Secret exists first
+
+An `envFrom`/`secretKeyRef` to a missing Secret leaves the pod in `CreateContainerConfigError` forever. On the
+original server an API sat three days like that. Make sure the Secret exists and has **every key** the app reads.
+
+## 15. Probes hit an endpoint that answers on that port
+
+Curl it from inside the cluster first. A liveness probe on a 404 restarts the pod forever and pages you (it happened,
+at night, with the monitoring's own exporter).
+
+## 16. Config changes never need a manual restart
+
+`node.sh deploy` fingerprints each workload's Secrets and ConfigMaps (annotation `anvil/config-hash`) and restarts
+only the ones whose config changed, printing `config changed: restarted <ns>/<name>`. Needing a manual
+`rollout restart` after a deploy is a bug.
+
+## 17. Standard labels on every object
+
+`app.kubernetes.io/part-of: <ns>`, `app.kubernetes.io/managed-by: anvil`, `anvil/tier: platform|app`; on workloads
+also `app.kubernetes.io/name` and `app.kubernetes.io/component` (`web`, `server`, `bot`, `job`, `backup`,
+`database`, `monitoring`, `app`), the last two also on the pod template. Backup CronJobs **must** carry
+`component: backup`: that's how the backup checks find them. See [Labels, not renames](/decisions/labels-not-renames/).
+
+## 18. Templates are valid YAML before rendering
+
+Manifests and `sites.yaml` contain `${ANVIL_*}` placeholders filled from `anvil.env` at deploy time. Quote any
+flow-style value that contains one (`hosts: ["demo.${ANVIL_DOMAIN}"]`), or the file isn't valid YAML before rendering.
+An unknown `${ANVIL_*}` fails the deploy rather than shipping an empty value.
+
+## 19. Every public site gets an edge-cache decision
+
+`edge_cache:` on its namespace in `sites.yaml`: either a cache time for anonymous visitors (the default answer: pages
+the same for everyone are served by Cloudflare, so a crowd costs the server nothing) or `false` with the reason
+(private, an API, live data). Exclude live paths (websockets, event streams) and admin pages; allow only public
+read-only API paths. Never cache a page that is personal without a cookie. Then `scripts/cloudflare-cache-rules.py`,
+`scripts/sites.py render` and `node.sh deploy edge-warmer`, and check `MISS` → `HIT` anonymous, `DYNAMIC` with a
+cookie. Details: [Edge caching](/components/edge/#edge-caching).

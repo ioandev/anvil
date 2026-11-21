@@ -1,0 +1,28 @@
+---
+import Diagram from './Diagram.astro'
+const boxes = [
+  { x: 20, y: 20, w: 290, h: 82, title: 'atlas-backup (03:30 UTC)', lines: ['mariadb-dump, one .sql.gz per database', 'as atlas_backup (read-only user)'] },
+  { x: 330, y: 20, w: 290, h: 82, title: "Apps' own backup jobs", lines: ["optional (e.g. SQLite .backup)", "label component: backup"] },
+  { x: 120, y: 156, w: 400, h: 100, kind: 'accent', title: 'Object Storage bucket (private)', lines: ['daily/<date>/<source>/ → deleted after 30 days', 'monthly/<YYYY-MM>/<source>/ (the 1st) → 365 days', 'server key: write objects only (no list, read, delete)'] },
+  { x: 20, y: 310, w: 180, h: 94, kind: 'danger', title: 'A night fails', lines: ['email (Scaleway TEM)', 'line on /error_arduino'] },
+  { x: 230, y: 310, w: 180, h: 94, title: 'backup-watch 08:00', lines: ['finds jobs by label;', 'emails if > 26 h old,', 'Monday: "backups OK"'] },
+  { x: 440, y: 310, w: 180, h: 94, title: 'Off-box pull', lines: ['home machine, 07:00,', 'read+list key, 90 days'] },
+  { x: 120, y: 446, w: 400, h: 82, kind: 'ok', title: 'Restore one database', lines: ['download → .data/<ns>/db.sql.gz', 'scripts/node.sh restore-db <ns>'] },
+]
+const edges = [
+  { d: 'M200,102 V154', kind: 'accent' },
+  { d: 'M440,102 V154', kind: 'accent' },
+  { d: 'M60,102 V308', kind: 'danger' },
+  { d: 'M480,256 V308', kind: 'dash' },
+  { d: 'M215,256 V444', kind: 'dash' },
+]
+const labels = [
+  { x: 320, y: 134, text: 'signed PUT (curl --aws-sigv4)', anchor: 'middle' },
+  { x: 488, y: 290, text: 'read + list key' },
+  { x: 222, y: 428, text: 'admin key, from your machine' },
+]
+---
+<Diagram id="bak" width={640} height={544} boxes={boxes} edges={edges} labels={labels}
+  title="Backup path"
+  desc="Nightly CronJobs dump every database and upload them with a write-only key to a private bucket with daily and monthly retention; failures email and post to the error latch; a morning watchdog checks the jobs ran; restores use an admin key from outside the server."
+  caption="Backup path: the server can add backups but never read, list or delete them, so a compromised server can't erase its history." />

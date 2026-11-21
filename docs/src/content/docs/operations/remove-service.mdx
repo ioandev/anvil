@@ -1,0 +1,50 @@
+---
+title: Remove a service
+description: Take a project or one workload off the platform cleanly - DNS, manifests, probes, database, backups, UIDs - without leaving alerts or orphans behind.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Removing is the reverse of [Add a site](/operations/add-site/), in an order that never leaves a probe pointing at
+something gone (which would call you).
+
+<Steps>
+
+1. **Take a final backup** if the data matters: run the backup job now
+   (`kubectl -n atlas create job --from=cronjob/atlas-backup zz-final-<ns>`), and keep a local dump in
+   `.data/<ns>/`. Delete the job afterwards.
+
+2. **Stop watching it first**: remove its `probes:` (and `www:`) from `sites.yaml`, then
+   `python3 -I scripts/sites.py render`, `python3 -I scripts/make-secrets.py`, and
+   `scripts/node.sh deploy alerting www`.
+
+3. **DNS**: point the hosts elsewhere or delete the records in Cloudflare (by hand or with your Cloudflare
+   script); delete the zone only if the domain leaves for good.
+
+4. **Delete the workloads**:
+
+   ```sh
+   scripts/node.sh kubectl delete namespace <ns>
+   ```
+
+   This removes its PVCs too (local-path deletes the data). For one workload inside a namespace, delete it from
+   `apps/<ns>/app.yaml` and `kubectl delete deploy/<name> service/<name> …` explicitly: `node.sh deploy` applies, it
+   doesn't prune.
+
+5. **Database**: remove `db:` from its `sites.yaml` entry and the `<NS>_RW/RO_PASSWORD` lines, then drop the database
+   and its two users by hand as root inside the atlas pod. `atlas-users` creates and updates; it doesn't drop.
+
+6. **Repo**: delete `apps/<ns>/` (and its `.sops` twins), remove it from `make apps` if listed, run
+   `sites.py render && sites.py check`, `make secrets-encrypt`, commit.
+
+7. **Keep its UID block retired**: list the block under `retired_uids` in `sites.yaml` so it is never reused.
+
+8. **Check** `/cluster` and `/overall` are 200, and Grafana's **"Gone"** panel shows the removed workloads (expected
+   for 7 days).
+
+</Steps>
+
+<Aside type="caution" title="Bulk deletes may need you">
+Claude Code's permission check may refuse dropping a production database or deleting volumes. That's intended: it
+writes the exact command into `HUMAN.md` and you run it.
+</Aside>

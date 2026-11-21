@@ -1,0 +1,39 @@
+# www.<domain> -> https://<domain>/<same path> (301) for every site with `www:` in sites.yaml. No pod: Traefik answers
+# itself (noop@internal). TLS: the Origin CA cert covers *.<domain> (default TLSStore). DNS: a proxied A record
+# www.<domain> -> the server (scripts/cutover.py). The route below is generated: scripts/sites.py render.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: www
+  labels: { app.kubernetes.io/part-of: www, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: redirect-to-apex, namespace: www, labels: { app.kubernetes.io/part-of: www, app.kubernetes.io/managed-by: anvil, anvil/tier: platform } }
+spec:
+  redirectRegex:
+    permanent: true
+    regex: '^https?://www\.([^/:]+)(?::\d+)?/?(.*)'
+    replacement: 'https://${1}/${2}'
+---
+# BEGIN generated from sites.yaml by scripts/sites.py render: edit sites.yaml, not this
+# (no site has `www:` in sites.yaml, so there is no redirect route)
+# END generated
+---
+# The platform's own domain is resolved inside the cluster by public resolvers that follow the real delegation, not
+# by the host's (Scaleway's), which cache the old answers from before the cutover: on the first real install they kept
+# answering "no such name" for demo.<domain> for hours after the switch to Cloudflare, so every probe (and /overall)
+# stayed red although the site worked. k3s's CoreDNS imports *.server files from this ConfigMap as extra server blocks.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+  labels: { app.kubernetes.io/part-of: www, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+data:
+  platform-domain.server: |
+    ${ANVIL_DOMAIN}:53 {
+        errors
+        cache 30
+        forward . 1.1.1.1 1.0.0.1 9.9.9.9
+    }

@@ -1,0 +1,52 @@
+---
+title: 'Decision: Cloudflare Free + own-CA origin pulls'
+description: Why every site sits behind Cloudflare's free plan, the origin trusts only your client certificate, and the server holds no Cloudflare token.
+---
+
+**Status:** accepted (2026-10).
+
+## Context
+
+One public IP serving ~15 domains. The origin should not be reachable except through the CDN, certificates
+should never expire on a Sunday, and a compromised server should not hand an attacker your DNS.
+
+## Decision
+
+1. Every zone on **Cloudflare Free**, proxied records, SSL mode **Full (strict)**.
+2. Firewall: **80/443 only from Cloudflare's IPv4 ranges**.
+3. **Authenticated Origin Pulls with your own CA**: Cloudflare presents a client certificate you generated; Traefik's
+   default TLSOption requires it. Not Cloudflare's shared certificate, which every Cloudflare customer can present.
+4. **Origin CA certificates** (15 years) issued from your laptop, in Traefik's default TLSStore. No ACME.
+5. The Cloudflare API token is **least-privilege** and **never on the server**.
+
+## Consequences
+
+- + Only your zones can complete a TLS handshake with the origin, even from inside Cloudflare's network.
+- + No certificate renewals to break; no DNS-01 token in a Kubernetes Secret.
+- + DDoS protection, caching and edge TLS for free.
+- − Everything depends on Cloudflare; a direct-to-origin test needs the client cert (`scripts/node.sh curl`).
+- − Free plan limits apply (e.g. request body size caps on uploads); a service that needs large uploads must live
+  outside the proxy with its own certificate.
+- − Moving a domain has traps: per-zone nameservers, edge certificate lag after activation, stale DNS at Google for
+  up to two days ([Edge](/components/edge/#moving-a-domain-onto-the-platform)).
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| Let's Encrypt with TLS-ALPN-01 | breaks behind Cloudflare's proxy (Let's Encrypt reaches the edge, not the origin) |
+| Let's Encrypt with DNS-01 | works, but puts a DNS-edit token on the server and needs renewals |
+| Cloudflare's shared origin-pull certificate | any Cloudflare customer can present it |
+| No CDN, open 80/443 | the origin IP is the attack surface; no edge cache or DDoS protection |
+
+## How it was decided
+
+- The owner asked that "no other server other than Cloudflare can access this server". Claude first moved SSH to
+  Tailscale-only; the owner overruled it ("I might lose Tailscale"), so SSH moved to an odd port instead, listening
+  on both ports until the new one was confirmed.
+- The owner suggested Authenticated Origin Pulls; Claude chose **an own CA** over Cloudflare's shared certificate.
+- Let's Encrypt came with the copied base repo. The owner asked "why are we running Let's Encrypt?" when he found a
+  Cloudflare token on the server; within minutes it was Origin CA certificates and no token on the server, and the old
+  account-wide token was revoked (which also killed keys that depended on it: rotate deliberately).
+- Client IPs: ServiceLB rewrites the source address, so Traefik trusts the pod CIDR for forwarded headers. That's
+  safe only because origin pulls guarantee the caller is Cloudflare. Apps use `CF-Connecting-IP`.

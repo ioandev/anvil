@@ -1,0 +1,175 @@
+---
+title: Monitoring & phone alerts
+description: Prometheus, Alertmanager, blackbox exporter, kube-state-metrics, a node exporter and Traefik's metrics, Grafana on the tailnet; three alert levels (phone, error latch, nowhere); twilio-alert turns critical alerts into phone calls; an off-box watchdog covers the server itself.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+Everything lives in `platform/alerting/app.yaml`, namespace `alerting`.
+
+## The stack
+
+| Workload | Image | Job | Reach it |
+|---|---|---|---|
+| `alerting-prometheus` | `prom/prometheus:v3.4.1` | scrapes, evaluates the [rules](/reference/alert-rules/) | tailnet `:9443` |
+| `alerting-alertmanager` | `prom/alertmanager:v0.28.1` | grouping, silences, re-sends every 5 min, "resolved" | tailnet `:8443` |
+| `alerting-blackbox` | `prom/blackbox-exporter:v0.27.0` | HTTP probes of every site **through Cloudflare**, every 30 s | in-cluster |
+| `alerting-kube-state-metrics` | `kube-state-metrics:v2.20.0` | every Deployment, StatefulSet, pod and Job (~25 MB) | in-cluster |
+| `alerting-node-exporter` | `prom/node-exporter:v1.9.1` | one unprivileged pod per node: CPU (steal included), memory, pressure, disk (~10–15 MB) | in-cluster |
+| `alerting-mysqld-exporter` | `prom/mysqld-exporter:v0.20.0` | replication status of atlas and any moved database, as `atlas_monitor` (status only, at most 3 connections; ~15 MB) | in-cluster |
+| `alerting-grafana` | `grafana/grafana:13.2.4` | dashboards (~250–280 MiB, limit 425Mi) | tailnet `:3443` |
+| `alerting-twilio` | `twilio-alert` (built from `images/twilio-alert`, multi-arch) | phone calls | in-cluster only |
+
+About 140 MB of RAM without Grafana. The UIs are published only on your tailnet: each has a Service with a
+**fixed ClusterIP**, and the node's `tailscale serve --https=<port>` proxies to it (set in Butane). They never get a
+public DNS record or Ingress. A ClusterIP can't change in place: delete and re-apply the Service to move it.
+
+## What is probed
+
+- **Every public part that can die on its own**, not just the home page: site, API health route, websocket or
+  realtime service, docs subdomain. A home page can load while its backend is dead. The URLs come from each site's
+  `probes:` list in `sites.yaml`; `make-secrets.py` turns them into Prometheus' `sites` job. Every probe sends
+  `Cookie: monitoring=1`, so it never gets Cloudflare's [cached copy](/components/edge/#edge-caching) of a site that is down.
+- **The status webhook's `/overall`** (disk, database, backups, cluster), as a probe job of its own.
+- **Every workload** through kube-state-metrics: bots, workers and cron jobs that have no URL are covered too.
+- **App metrics** where an app exposes them: list `host:port/path` under the app's `metrics:` in `sites.yaml`. The demo's
+  worker heartbeat drives `AnvilDemoWorkerStuck`. (On the original platform one app's own metrics catch a stuck queue,
+  an old unsent email, a bot that stopped polling and high heap: alerting on business health, not just "is it up".)
+
+## Three alert levels
+
+Every rule carries a `severity`, and Alertmanager routes on it (`scripts/make-secrets.py` writes the routing):
+
+| Severity | Goes to | Meaning |
+|---|---|---|
+| `critical` | **the phone** (twilio-alert's call schedule, quiet hours wait) | something is down or data is being lost now |
+| `notify` | **the error latch** (`/error_arduino`), one line per alert and site per day | look at it soon: capacity running out, a site failing for some visitors |
+| `warning` | nowhere (shown in Alertmanager and Grafana only) | informational: a moved database's copy stopped or lagging before a cutover |
+
+`notify` alerts reach the latch through webhookd's `am_latch` hook (Alertmanager's webhook, re-sent every 6 h; the
+hook writes one line per alert and site per UTC day, so a problem that lasts doesn't fill the latch). A rule with
+any other severity (the demo's `AnvilDemoWorkerStuck` says `page`) falls through to the phone, like `critical`. The
+[autopilot](/components/autopilot/) ignores `warning` and `notify` alerts: neither starts a run.
+
+## Capacity: alerts that come before failures
+
+Errors arrive only after latency has climbed, and latency only after a resource ran out. So the platform also watches
+the resources and the answers, and writes them to the latch before anyone is phoned.
+
+**The nodes' own figures** come from `alerting-node-exporter`, one ordinary pod per node (a DaemonSet that tolerates
+every taint, so pool nodes and the light node are covered too), unprivileged, with **no host access**: no host
+network, no host PID, no host mounts. None is needed. Inside a container, `/proc/stat`, `/proc/meminfo` and
+`/proc/pressure` already show the whole node (steal included), and the container's root filesystem sits on the
+node's disk, so its free space is the node's. Prometheus finds the pods through a read-only Role on pods in
+`alerting`.
+
+**The sites' figures** come from Traefik's own metrics: k3s's Traefik serves them on `:9100`, and Prometheus
+finds every Traefik pod in kube-system by its label (a read-only Role there), so a pool's direct-mode Traefik is counted
+too. Only `traefik_service_requests_total` (per site and
+status code) and the duration buckets are kept. "Failed" means **5xx, 429 (refused for overload) and 408 (timed
+out)**. 404 doesn't count, nor 401/403 (bots probing admin pages cause them all day), nor websocket closes
+(`code="0"`). A minimum traffic level keeps one failed bot request on a quiet site from counting.
+
+| Alert | Fires when | Level |
+|---|---|---|
+| `NodeCPUHigh` | a node is over **65% busy, counting steal**, for 15 min | notify |
+| `NodeCPUStealHigh` | other customers of the cloud take over 30% of a node's CPU for 30 min | notify |
+| `NodeMemoryLow` | under 600 MB available for 10 min (keep about 1 GB free) | notify |
+| `NodeMemoryPressure` | tasks stall on memory over 10% of the time for 10 min (swapping) | notify |
+| `NodeSwapHeavy` | over 1.5 GB of swap in use for 15 min | notify |
+| `NodeDiskLow` | under 3 GB free on a node's `/` (a full disk makes the kubelet evict pods) | notify |
+| `ContainerOOMKilled` | a container was killed for using more memory than its limit | notify |
+| `SiteErrorsHigh` | over **5%** of a site's requests failed for 10 min (at least 0.2 requests/s) | notify |
+| `SiteErrorsCritical` | over **20%** failing for 5 min (at least 1 request/s) | **phone** |
+| `SiteSlow` | a site's 95th-percentile answer over 2 s for 15 min | notify |
+| `ProbeSlow` | a probe through Cloudflare takes over 5 s for 10 min | notify |
+
+[`/memory`](/reference/endpoints/) (public, no code) shows the same memory figure live: 200 while the node has at
+least 500 MB available.
+
+### Why the CPU figure is (all − idle) ÷ all
+
+The CPU figure is `(all CPU time − idle) ÷ all CPU time`, each summed over the node's cores, and it counts **steal**
+(time the cloud's host gave to someone else) as busy, because it isn't time your pods can use. The first version on
+the original server used `1 − average idle`, and it reported a false **72–84%** while the node was really about 40%
+busy: replacing the node-exporter pods twice in a few minutes had left short-lived series whose rates were near zero,
+and "1 − idle" read those as 100% busy. The summed form can't be skewed that way.
+
+**Dozzle shows less CPU than the alert** (on the original server 10–13% against about 40%): it adds up only the
+containers. The alert's figure also counts steal (about 16% there, on a shared-CPU instance), k3s and containerd
+(about 5%) and the kernel's network work for every request (irq/softirq, about 7%: Traefik's traffic).
+
+## Rules, in short
+
+- Most rules need the condition to hold **5 minutes** (`for: 5m`) before firing; the capacity rules wait 10–30.
+- **Work in progress is ignored for 10 minutes**: a Deployment/StatefulSet created or changed (its `generation`
+  went up), a pod younger than 10 minutes, and a site whose namespace had such a change. Whoever is deploying is
+  watching; if it's still broken 10 minutes after the last change, the 5-minute confirmation starts.
+- Pod rules count only pods that still exist (`and on (namespace, pod) kube_pod_info`), so a replaced pod's history
+  doesn't keep paging.
+- `ProbesMissing` fires when the probes or kube-state-metrics go silent: a blind monitor must not look healthy.
+- `Watchdog` always fires on purpose (see below). Resolved alerts never call.
+- Scale-out adds `PoolNodeDown` and the moved-database rules: see [Scale a site out](/operations/scale-out/#monitoring).
+
+Full list: [Reference → Alert rules](/reference/alert-rules/).
+
+## Phone calls: twilio-alert
+
+Alertmanager sends firing and resolved alerts to `alerting-twilio`, which calls you through Twilio. Everything is
+environment in the manifest:
+
+| Env | Default | Meaning |
+|---|---|---|
+| `CALL_SCHEDULE_MINUTES` | `2,4,6,8,12,17,22,32,47,62` | minutes after an incident opens (the rules already waited 5 min); the first 2 let the autopilot hold the calls first |
+| `CALL_REPEAT_MINUTES` | `60` | after the schedule runs out: hourly |
+| `QUIET_HOURS` / `QUIET_TIMEZONE` | `03-07`, `Europe/London` (set in `platform/alerting/app.yaml`; keep them in line with `ANVIL_QUIET_HOURS` and `ANVIL_TIMEZONE`) | no calls then; they wait |
+| `ACK_SNOOZE_MINUTES` | `60` | picking up (speaking or silent) pauses calls this long |
+
+- **Voicemail does not count** as answered (answering-machine detection), so calls go on until a person picks up.
+- Alertmanager re-sends every 5 minutes and sends **resolved**, which ends the calls.
+- **When the autopilot gives up** (any result but fixed), twilio-alert calls **at once** and keeps its own problem open
+  for 60 minutes. This matters because the autopilot's own restart or rollback counts as a recent change, which the
+  rules ignore for 10 minutes: the alert can look resolved while the problem is still there.
+- While the [autopilot](/components/autopilot/) works on an incident, calls are **held** for at most 20 minutes, once
+  per incident; if it leaves a summary, the next call says "Autopilot says: …".
+- `POST /test-call?password=…` places one test call (never pauses real alerts); `GET /pager?password=…` shows its
+  state (`problems`, `autopilotUntil`, the summary). Both are in-cluster only.
+
+<Aside type="caution" title="A silence doesn't stop calls already scheduled">
+Silencing in Alertmanager stops **new** notifications. twilio-alert keeps its schedule until it receives "resolved"
+(or 20 minutes pass without updates). How to stop it at once: [Silence or stop alerts](/operations/silence-alerts/).
+</Aside>
+
+## The watchdog for the watchdog
+
+Alerting on the server can't tell you the server is gone. So:
+
+1. `Watchdog` (`expr: vector(1)`) always fires and is routed to the status webhook's `/am_heartbeat` (every 15 min),
+   never to the phone. Firing = healthy.
+2. A **second machine** (the Mac mini) runs its own twilio-alert in watchdog mode: every minute it pulls
+   `/watchdog?code=…` and calls if that is unreachable for **10 minutes** or answers `ok:false` (no heartbeat for
+   **2 hours**: alerting is dead). It calls at once, without the 5-minute grace: a dead server can't wait.
+3. A silence on `Watchdog` in Alertmanager also mutes the Mac: `/watchdog` returns `mutedUntil`, which the Mac
+   remembers even if the server then disappears (for planned maintenance).
+4. `MacOffline` covers the reverse: the autopilot on the Mac posts a heartbeat every 15 s; no heartbeat for
+   10 minutes calls you.
+
+Nothing on the server connects to the Mac: the Mac pulls.
+
+## Grafana
+
+Provisioned from ConfigMaps (data source + an overview dashboard). Anonymous Editor on the tailnet; an admin login
+from `prod.env`. The overview **starts with the autopilot** (state, paused and when it resumes, the home machine's last
+heartbeat, runs today, the last run, a state timeline, links to the [run viewer](/components/autopilot/#the-run-viewer)),
+then sections for sites and the cluster. The **Cluster** section shows
+services not fully ready, pods that can't start, restarts, a ready/not-ready timeline per service, and **"Gone"**:
+Deployments/StatefulSets that existed in the last 7 days but don't now (empty = good; it's how a service that
+silently vanished shows up). The **hide** box (default `zz-.*`) filters throwaway namespaces
+([rule 12](/reference/app-rules/#12-throwaway-things-start-with-zz-)).
+
+## Logs: Dozzle
+
+Dozzle (Kubernetes mode) shows live logs of every pod, tailnet only. It runs on the host network but listens on
+`127.0.0.1:18080`, which `tailscale serve` publishes; there's no Service, Ingress or DNS record. Its ClusterRole is
+`get/list/watch` only (no `exec`, no `delete`, no Secrets), so nobody can open a shell or restart anything through
+it. It has no login of its own: the tailnet is the login, as for Grafana and Prometheus.

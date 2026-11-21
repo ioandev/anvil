@@ -1,0 +1,1672 @@
+# alerting: phone calls when something is wrong on ${ANVIL_NAME}.
+#   Prometheus probes the sites (through Cloudflare, like a visitor) and the server's own health page every 30 s,
+#   evaluates the rules below, and hands firing alerts to Alertmanager, which calls twilio-alert, which phones the
+#   owner through Twilio (source: /repos/twilio-webhook). Resolved alerts never call.
+#   An always-firing "Watchdog" alert is Alertmanager's heartbeat to webhookd (/am_heartbeat); the Mac mini's own
+#   twilio-webhook (~/${ANVIL_NAME}-watchdog) reads /watchdog and calls if ${ANVIL_NAME} or this alerting is dead. Silencing
+#   "Watchdog" in Alertmanager mutes the Mac too.
+# Alertmanager UI (silences): Tailscale only, https://${ANVIL_TAILNET_HOST}:8443 (tailscale serve -> the fixed
+#   ClusterIP below). Prometheus UI: Tailscale only, https://${ANVIL_TAILNET_HOST}:9443 (same way).
+# Configs with secrets (Prometheus targets incl. the status code, Alertmanager's receivers): Secret alerting-config,
+# built by scripts/make-secrets.py from platform/alerting/prod.env. Twilio credentials:.
+# Grafana (dashboards): Tailscale only, https://${ANVIL_TAILNET_HOST}:3443 (section at the end).
+# kube-state-metrics: cluster state for the "is anything stuck" rules. UIDs 5490-5495.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alerting
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerting-rules
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+data:
+  alerts.yml: |
+    groups:
+      - name: ${ANVIL_NAME}
+        rules:
+          # Always firing: Alertmanager's heartbeat (routed to webhookd, never to the phone).
+          - alert: Watchdog
+            expr: vector(1)
+            labels: { severity: none }
+            annotations: { summary: "Alertmanager heartbeat (always firing)" }
+
+          - alert: ServerHealthRed
+            expr: max(probe_success{job="overall"}) == 0
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "status.${ANVIL_DOMAIN}/overall is red: disk, database, emails or backups" }
+
+          - alert: SiteDown
+            expr: >-
+              (max by (instance, namespace) (probe_success{job="sites"}) == 0)
+                unless on (namespace) (max by (namespace) ((time() - kube_deployment_created < 600) or (changes(kube_deployment_metadata_generation[10m]) > 0)))
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.instance }} is down" }
+
+          # Example of an app's own rule (the demo app): its worker stopped processing (heartbeat older than 2 min).
+          - alert: AnvilDemoWorkerStuck
+            expr: time() - max(anvil_demo_worker_last_run_timestamp_seconds) > 120
+            for: 2m
+            labels: { severity: critical }
+            annotations:
+              summary: "anvil-demo's worker hasn't processed its queue for over 2 minutes"
+          - alert: ServiceUnavailable
+            expr: (max by (namespace, deployment) (kube_deployment_spec_replicas - kube_deployment_status_replicas_available) > 0) unless on (namespace, deployment) ((time() - kube_deployment_created < 600) or (changes(kube_deployment_metadata_generation[10m]) > 0))
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.namespace }}/{{ $labels.deployment }} has had fewer ready copies than it should for 5 minutes" }
+          - alert: StatefulSetUnavailable
+            expr: (max by (namespace, statefulset) (kube_statefulset_replicas - kube_statefulset_status_replicas_ready) > 0) unless on (namespace, statefulset) ((time() - kube_statefulset_created < 600) or (changes(kube_statefulset_metadata_generation[10m]) > 0))
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.namespace }}/{{ $labels.statefulset }} has had fewer ready copies than it should for 5 minutes" }
+          - alert: PodCannotStart
+            expr: >-
+              (max by (namespace, pod, reason) (kube_pod_container_status_waiting_reason{reason=~"CreateContainerConfigError|CreateContainerError|ImagePullBackOff|ErrImagePull|InvalidImageName|CrashLoopBackOff|RunContainerError"}) == 1)
+                unless on (namespace, pod) (time() - kube_pod_created < 600)
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.namespace }}/{{ $labels.pod }} can't start: {{ $labels.reason }}" }
+          - alert: PodRestartingOften
+            # only pods that still exist: a replaced pod's old restarts would otherwise keep it firing for 30 min
+            expr: ((max by (namespace, pod) (increase(kube_pod_container_status_restarts_total[30m])) > 3) and on (namespace, pod) kube_pod_info) unless on (namespace, pod) (time() - kube_pod_created < 600)
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.namespace }}/{{ $labels.pod }} restarted {{ $value | humanize }} times in 30 minutes" }
+          # A failed Job (backups, health-watch, seed): fires for 6 h after the job started, then resolves on its own.
+          - alert: JobFailed
+            expr: >-
+              max by (namespace, job_name) (kube_job_failed{condition="true"} == 1)
+                and on (namespace, job_name) (time() - kube_job_status_start_time < 21600)
+            labels: { severity: critical }
+            annotations: { summary: "Job {{ $labels.namespace }}/{{ $labels.job_name }} failed" }
+
+          # The Mac mini (autopilot, the watchdog, OpenBao) stopped reporting: its autopilot posts a
+          # heartbeat to webhookd every 15 s (outgoing only; ${ANVIL_NAME} never connects to the Mac). Covers the Mac being
+          # off, asleep, stuck at the FileVault screen after a reboot, Docker down, or the autopilot itself dead.
+          - alert: MacOffline
+            expr: time() - autopilot_last_heartbeat_seconds > 600
+            labels: { severity: critical }
+            annotations: { summary: "The Mac mini hasn't checked in for {{ $value | humanizeDuration }}: autopilot and watchdog are probably down" }
+
+          # The probes themselves stopped (blackbox or a scrape broken): silence would look healthy.
+          - alert: ProbesMissing
+            expr: absent(probe_success{job="sites"}) or absent(probe_success{job="overall"}) or absent(kube_deployment_spec_replicas)
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "the server's monitoring is blind: probes or kube-state-metrics not reporting" }
+
+          # --- Capacity and failures (docs: Monitoring → Alerts). severity "notify" = the error latch (look at it soon),
+          # "critical" = the phone. CPU counts what other customers of the cloud take (steal): it isn't idle time.
+          # busy = (all − idle) ÷ all, summed: "1 − average idle" reads a replaced exporter pod's short series as 100%.
+          - alert: NodeCPUHigh
+            expr: |
+              100 * (1 - sum by (node) (rate(node_cpu_seconds_total{mode="idle"}[5m]))
+                         / sum by (node) (rate(node_cpu_seconds_total[5m]))) > 65
+            for: 15m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: CPU {{ $value | printf \"%.0f\" }}% busy (incl. steal) for 15 min (limit 65%)" }
+          - alert: NodeCPUStealHigh
+            expr: |
+              100 * sum by (node) (rate(node_cpu_seconds_total{mode="steal"}[10m]))
+                  / sum by (node) (rate(node_cpu_seconds_total[10m])) > 30
+            for: 30m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: other customers take {{ $value | printf \"%.0f\" }}% of the CPU (steal) for 30 min" }
+          - alert: NodeMemoryLow
+            expr: node_memory_MemAvailable_bytes / 1048576 < 600
+            for: 10m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: only {{ $value | printf \"%.0f\" }} MB of memory available for 10 min (keep ~1 GB free)" }
+          - alert: NodeMemoryPressure
+            expr: rate(node_pressure_memory_stalled_seconds_total[5m]) > 0.10
+            for: 10m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: tasks stalled on memory {{ $value | humanizePercentage }} of the time for 10 min (swapping)" }
+          - alert: NodeSwapHeavy
+            expr: (node_memory_SwapTotal_bytes - node_memory_SwapFree_bytes) / 1048576 > 1500
+            for: 15m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: {{ $value | printf \"%.0f\" }} MB of swap in use for 15 min" }
+          - alert: NodeDiskLow
+            expr: node_filesystem_avail_bytes{mountpoint="/"} / 1073741824 < 3
+            for: 10m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.node }}: {{ $value | printf \"%.1f\" }} GB free on / (a full disk makes the kubelet evict pods)" }
+          - alert: SiteErrorsHigh
+            expr: |
+              (sum by (service) (rate(traefik_service_requests_total{code=~"5..|429|408"}[10m]))
+                / sum by (service) (rate(traefik_service_requests_total{code!="0"}[10m]))) > 0.05
+              and sum by (service) (rate(traefik_service_requests_total{code!="0"}[10m])) > 0.2
+            for: 10m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.service }}: {{ $value | humanizePercentage }} of requests failed (5xx/429/408; not 404/401/403) for 10 min" }
+          - alert: SiteErrorsCritical
+            expr: |
+              (sum by (service) (rate(traefik_service_requests_total{code=~"5..|429|408"}[5m]))
+                / sum by (service) (rate(traefik_service_requests_total{code!="0"}[5m]))) > 0.20
+              and sum by (service) (rate(traefik_service_requests_total{code!="0"}[5m])) > 1
+            for: 5m
+            labels: { severity: critical }
+            annotations: { summary: "{{ $labels.service }}: {{ $value | humanizePercentage }} of requests failing (5xx/429/408) for 5 min" }
+          - alert: SiteSlow
+            expr: |
+              histogram_quantile(0.95, sum by (service, le) (rate(traefik_service_request_duration_seconds_bucket{code!="0"}[10m]))) > 2
+              and sum by (service) (rate(traefik_service_request_duration_seconds_count{code!="0"}[10m])) > 0.2
+            for: 15m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.service }}: 95% of answers take up to {{ $value | printf \"%.1f\" }} s (over 2 s for 15 min)" }
+          - alert: ProbeSlow
+            expr: probe_duration_seconds{job="sites"} > 5
+            for: 10m
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.instance }}: the probe takes {{ $value | printf \"%.1f\" }} s (over 5 s for 10 min)" }
+          - alert: ContainerOOMKilled
+            expr: |
+              (increase(kube_pod_container_status_restarts_total[15m]) > 0)
+                and on (namespace, pod, container) (kube_pod_container_status_last_terminated_reason{reason="OOMKilled"} == 1)
+            labels: { severity: notify }
+            annotations: { summary: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) was killed for using more memory than its limit" }
+          # --- Scale-out (infra/pools.tf, scripts/move-db). A pool node that a site may live on, gone; the moved database's
+          # live copies stopped or lagging. The safety net (atlas following the moved database) is the one that phones.
+          - alert: PoolNodeDown
+            expr: max by (node) (kube_node_status_condition{condition="Ready",status="true",node=~"${ANVIL_NAME}-.+-[0-9]+",node!~"${ANVIL_NAME}-agent-.*"}) == 0
+            for: 2m
+            labels: { severity: critical }
+            annotations: { summary: "pool node {{ $labels.node }} is not Ready: if a site lives there, run scripts/pool rescue <pool>" }
+          - alert: MovedDatabaseSafetyNetStopped
+            expr: max by (instance, connection_name) (mysql_slave_status_slave_io_running{instance="atlas-mariadb.atlas:3306"} == 0 or mysql_slave_status_slave_sql_running{instance="atlas-mariadb.atlas:3306"} == 0)
+            for: 3m
+            labels: { severity: critical }
+            annotations: { summary: "atlas stopped following the moved database ({{ $labels.connection_name }}): no live copy if its server dies; scripts/move-db <ns> status" }
+          - alert: MovedDatabaseReplicationStopped
+            expr: max by (instance, connection_name) (mysql_slave_status_slave_io_running{instance!="atlas-mariadb.atlas:3306"} == 0 or mysql_slave_status_slave_sql_running{instance!="atlas-mariadb.atlas:3306"} == 0)
+            for: 3m
+            labels: { severity: warning }
+            annotations: { summary: "{{ $labels.instance }} stopped following atlas (before a cutover: nothing lost; scripts/move-db <ns> status)" }
+          - alert: MovedDatabaseReplicaLag
+            expr: max by (instance, connection_name) (mysql_slave_status_seconds_behind_master) > 30
+            for: 5m
+            labels: { severity: warning }
+            annotations: { summary: "{{ $labels.instance }} ({{ $labels.connection_name }}) is {{ $value }} s behind" }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerting-blackbox
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+data:
+  blackbox.yml: |
+    modules:
+      http_2xx:
+        prober: http
+        timeout: 15s
+        http:
+          preferred_ip_protocol: ip4
+          follow_redirects: true
+          valid_status_codes: []        # any 2xx
+          # A cookie, so the probe always reaches the site itself, never Cloudflare's cached copy (edge_cache):
+          # a site that's down must not look up because its home page is cached.
+          headers: { Cookie: "monitoring=1" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-twilio
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  selector: { app: alerting-twilio }
+  ports: [{ name: http, port: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-twilio
+  labels: { app.kubernetes.io/name: alerting-twilio, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alerting-twilio } }
+  template:
+    metadata: { labels: { app: alerting-twilio, app.kubernetes.io/name: alerting-twilio, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      imagePullSecrets: [{ name: anvil-registry }]
+      securityContext: { runAsNonRoot: true, runAsUser: 5490, runAsGroup: 5490 }
+      containers:
+        - name: twilio
+          image: ${ANVIL_REGISTRY}/twilio-alert:${ANVIL_TWILIO_TAG}
+          envFrom: [{ secretRef: { name: twilio-env } }]
+          env:
+            # First call 2 minutes after an incident opens, then the burst. The rules already wait 5 minutes (`for: 5m`,
+            # the grace for blips), so the first ring comes ~7.5 min after the problem starts; the 2 minutes let the
+            # autopilot (it starts ~30 s after the alert) hold the calls first. If it gives up, twilio-alert calls at once.
+            - { name: CALL_SCHEDULE_MINUTES, value: "2,4,6,8,12,17,22,32,47,62" }
+            # No calls 03:00-07:00 UK time (a call due then waits until 07:00); then hourly repeats; answering pauses 60 min.
+            - { name: QUIET_HOURS, value: "${ANVIL_QUIET_HOURS}" }
+            - { name: QUIET_TIMEZONE, value: "${ANVIL_TIMEZONE}" }
+            - { name: CALL_REPEAT_MINUTES, value: "60" }
+            - { name: ACK_SNOOZE_MINUTES, value: "60" }
+          ports: [{ name: http, containerPort: 3000 }]
+          readinessProbe: { httpGet: { path: /healthz, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /healthz, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 48Mi }, limits: { memory: 160Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-blackbox
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  selector: { app: alerting-blackbox }
+  ports: [{ name: http, port: 9115 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-blackbox
+  labels: { app.kubernetes.io/name: alerting-blackbox, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alerting-blackbox } }
+  template:
+    metadata: { labels: { app: alerting-blackbox, app.kubernetes.io/name: alerting-blackbox, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5491, runAsGroup: 5491 }
+      containers:
+        - name: blackbox
+          image: docker.io/prom/blackbox-exporter:v0.27.0
+          args: ["--config.file=/etc/blackbox/blackbox.yml"]
+          ports: [{ name: http, containerPort: 9115 }]
+          readinessProbe: { httpGet: { path: /-/healthy, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /-/healthy, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 24Mi }, limits: { memory: 96Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: config, mountPath: /etc/blackbox }]
+      volumes: [{ name: config, configMap: { name: alerting-blackbox } }]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alerting-prometheus
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 2Gi } }
+---
+# Fixed ClusterIP: the node's `tailscale serve --https=9443` points at it, so the UI is on the tailnet only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-prometheus
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  clusterIP: 10.43.200.90
+  selector: { app: alerting-prometheus }
+  ports: [{ name: http, port: 9090 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-prometheus
+  labels: { app.kubernetes.io/name: alerting-prometheus, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # RWO data volume
+  selector: { matchLabels: { app: alerting-prometheus } }
+  template:
+    metadata: { labels: { app: alerting-prometheus, app.kubernetes.io/name: alerting-prometheus, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      serviceAccountName: alerting-prometheus   # read-only: list pods in alerting (finds the node exporters)
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5492, runAsGroup: 5492, fsGroup: 5492 }
+      containers:
+        - name: prometheus
+          image: docker.io/prom/prometheus:v3.4.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            - --storage.tsdb.retention.size=1GB
+          ports: [{ name: http, containerPort: 9090 }]
+          readinessProbe: { httpGet: { path: /-/ready, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /-/healthy, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 20m, memory: 96Mi }, limits: { memory: 320Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus/prometheus.yml, subPath: prometheus.yml }
+            - { name: rules, mountPath: /etc/prometheus/rules }
+            - { name: data, mountPath: /prometheus }
+      volumes:
+        - { name: config, secret: { secretName: alerting-config } }
+        - { name: rules, configMap: { name: alerting-rules } }
+        - { name: data, persistentVolumeClaim: { claimName: alerting-prometheus } }
+---
+# Silences live here, so they survive restarts (the Mac reads them through /watchdog).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alerting-alertmanager
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 100Mi } }
+---
+# Fixed ClusterIP: the node's `tailscale serve --https=8443` points at it (Butane tailscale-bootstrap), so the UI is
+# reachable on the tailnet only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-alertmanager
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  clusterIP: 10.43.200.93
+  selector: { app: alerting-alertmanager }
+  ports: [{ name: http, port: 9093 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-alertmanager
+  labels: { app.kubernetes.io/name: alerting-alertmanager, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  replicas: 1
+  strategy: { type: Recreate }   # RWO data volume
+  selector: { matchLabels: { app: alerting-alertmanager } }
+  template:
+    metadata: { labels: { app: alerting-alertmanager, app.kubernetes.io/name: alerting-alertmanager, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5493, runAsGroup: 5493, fsGroup: 5493 }
+      containers:
+        - name: alertmanager
+          image: docker.io/prom/alertmanager:v0.28.1
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+            - --web.external-url=https://${ANVIL_TAILNET_HOST}:8443/
+            - --cluster.listen-address=
+          ports: [{ name: http, containerPort: 9093 }]
+          readinessProbe: { httpGet: { path: /-/ready, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /-/healthy, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: config, mountPath: /etc/alertmanager/alertmanager.yml, subPath: alertmanager.yml }
+            - { name: data, mountPath: /alertmanager }
+      volumes:
+        - { name: config, secret: { secretName: alerting-config } }
+        - { name: data, persistentVolumeClaim: { claimName: alerting-alertmanager } }
+---
+# kube-state-metrics: every Deployment/StatefulSet/Pod/Job's state as metrics, so Prometheus can call when anything in the
+# cluster is stuck (rules above: ServiceUnavailable, PodCannotStart, ...). Read-only (list/watch), ~30 MB.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alerting-kube-state-metrics
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: alerting-kube-state-metrics
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
+    verbs: [list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: alerting-kube-state-metrics
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: alerting-kube-state-metrics }
+subjects: [{ kind: ServiceAccount, name: alerting-kube-state-metrics, namespace: alerting }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-kube-state-metrics
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  selector: { app: alerting-kube-state-metrics }
+  ports: [{ name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-kube-state-metrics
+  labels: { app.kubernetes.io/name: alerting-kube-state-metrics, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: alerting-kube-state-metrics } }
+  template:
+    metadata: { labels: { app: alerting-kube-state-metrics, app.kubernetes.io/name: alerting-kube-state-metrics, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      serviceAccountName: alerting-kube-state-metrics
+      securityContext: { runAsNonRoot: true, runAsUser: 5495, runAsGroup: 5495 }
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+          args:
+            - --resources=pods,deployments,statefulsets,daemonsets,replicasets,jobs,cronjobs,nodes,namespaces
+            - --port=8080
+            - --telemetry-port=8081
+          ports: [{ name: http, containerPort: 8080 }]
+          # /readyz is on the telemetry port (8081), /livez on the metrics port (8080): the other way round is a 404
+          # (it got restarted every few minutes and called the owner on 2026-10-27).
+          readinessProbe: { httpGet: { path: /readyz, port: 8081 }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /livez, port: 8080 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 48Mi }, limits: { memory: 128Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+---
+# Grafana: dashboards over Prometheus, Tailscale only: https://${ANVIL_TAILNET_HOST}:3443 (tailscale serve ->
+# the fixed ClusterIP below). Anyone on the tailnet gets in as Editor without logging in (the tailnet is the login, as
+# for Prometheus/Alertmanager); the admin account (user `admin`, GRAFANA_ADMIN_PASSWORD in platform/alerting/prod.env)
+# is only for users/settings. Data source and the "${ANVIL_NAME} overview" dashboard are provisioned from the ConfigMaps
+# below (edit them here; changes made in the UI to the provisioned dashboard are kept until the next restart only:
+# save a copy for your own). Grafana 13 uses ~250-280 MiB; limit 425Mi (owner's OK, 2026-10-24).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerting-grafana-provisioning
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - { name: Prometheus, type: prometheus, uid: prometheus, url: "http://alerting-prometheus:9090", access: proxy, isDefault: true, editable: false }
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - { name: "${ANVIL_NAME}", folder: "${ANVIL_NAME}", type: file, allowUiUpdates: true, options: { path: /var/lib/grafana-dashboards } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alerting-grafana-dashboards
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+data:
+  anvil-overview.json: |
+    {
+     "uid": "anvil-overview",
+     "title": "${ANVIL_NAME} overview",
+     "tags": [
+      "${ANVIL_NAME}"
+     ],
+     "timezone": "browser",
+     "schemaVersion": 39,
+     "refresh": "30s",
+     "time": {
+      "from": "now-6h",
+      "to": "now"
+     },
+     "panels": [
+      {
+       "id": 30,
+       "type": "row",
+       "title": "Autopilot (Claude on the home machine): every run in detail at https://${ANVIL_TAILNET_HOST}:8446",
+       "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+       },
+       "collapsed": false
+      },
+      {
+       "id": 31,
+       "type": "stat",
+       "title": "State",
+       "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 6,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "sum(autopilot_state{state=\"idle\"})*0 + sum(autopilot_state{state=\"running\"})*1 + sum(autopilot_state{state=\"gave_up\"})*2 + sum(autopilot_state{state=\"paused\"})*3 + (time() - max(autopilot_last_heartbeat_seconds) > bool 600) * 10",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "watching",
+             "color": "green"
+            },
+            "1": {
+             "text": "working",
+             "color": "blue"
+            },
+            "2": {
+             "text": "gave up",
+             "color": "red"
+            },
+            "3": {
+             "text": "paused",
+             "color": "orange"
+            },
+            "10": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "11": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "12": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "13": {
+             "text": "Mac not reporting",
+             "color": "red"
+            }
+           }
+          }
+         ],
+         "noValue": "no data from the Mac"
+        },
+        "overrides": []
+       },
+       "description": "watching = ready to act on alerts; paused = a deploy or you paused it (it resumes by itself, see 'Resumes in'); gave up = latched until 60 min pass, 2 min healthy, or https://status.${ANVIL_DOMAIN}/autopilot_reset?code=…; Mac not reporting = no heartbeat for 10 min."
+      },
+      {
+       "id": 35,
+       "type": "stat",
+       "title": "Paused: resumes by itself in",
+       "gridPos": {
+        "x": 6,
+        "y": 1,
+        "w": 5,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "clamp_min(max(autopilot_paused_until_seconds) - time(), 0)",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "decimals": 0,
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "not paused",
+             "color": "green"
+            }
+           }
+          }
+         ],
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "orange",
+            "value": 1
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "scripts/node.sh deploy pauses the autopilot for 10 minutes (NO_AUTOPILOT_PAUSE=1 skips it); it resumes by itself. Resume now: https://status.${ANVIL_DOMAIN}/autopilot_resume?code=…"
+      },
+      {
+       "id": 32,
+       "type": "stat",
+       "title": "Mac last checked in",
+       "gridPos": {
+        "x": 11,
+        "y": 1,
+        "w": 4,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "time() - autopilot_last_heartbeat_seconds",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "orange",
+            "value": 120
+           },
+           {
+            "color": "red",
+            "value": 600
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "MacOffline calls after 10 minutes"
+      },
+      {
+       "id": 33,
+       "type": "stat",
+       "title": "Runs today",
+       "gridPos": {
+        "x": 15,
+        "y": 1,
+        "w": 4,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "autopilot_runs_today",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "orange",
+            "value": 3
+           },
+           {
+            "color": "red",
+            "value": 4
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "At most 4 a day; then only a reset re-arms it"
+      },
+      {
+       "id": 34,
+       "type": "stat",
+       "title": "Last run",
+       "gridPos": {
+        "x": 19,
+        "y": 1,
+        "w": 5,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "sum(autopilot_last_run_result{result=\"fixed\"})*1 + sum(autopilot_last_run_result{result=\"gave_up\"})*2 + sum(autopilot_last_run_result{result=\"error\"})*3 + sum(autopilot_last_run_result{result=\"timeout\"})*4",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "none yet",
+             "color": "text"
+            },
+            "1": {
+             "text": "fixed",
+             "color": "green"
+            },
+            "2": {
+             "text": "gave up",
+             "color": "red"
+            },
+            "3": {
+             "text": "error",
+             "color": "red"
+            },
+            "4": {
+             "text": "timed out",
+             "color": "red"
+            }
+           }
+          }
+         ]
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 36,
+       "type": "state-timeline",
+       "title": "Autopilot state over time",
+       "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 18,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "sum(autopilot_state{state=\"idle\"})*0 + sum(autopilot_state{state=\"running\"})*1 + sum(autopilot_state{state=\"gave_up\"})*2 + sum(autopilot_state{state=\"paused\"})*3 + (time() - max(autopilot_last_heartbeat_seconds) > bool 600) * 10",
+         "legendFormat": "autopilot"
+        }
+       ],
+       "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "legend": {
+         "showLegend": false
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "watching",
+             "color": "green"
+            },
+            "1": {
+             "text": "working",
+             "color": "blue"
+            },
+            "2": {
+             "text": "gave up",
+             "color": "red"
+            },
+            "3": {
+             "text": "paused",
+             "color": "orange"
+            },
+            "10": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "11": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "12": {
+             "text": "Mac not reporting",
+             "color": "red"
+            },
+            "13": {
+             "text": "Mac not reporting",
+             "color": "red"
+            }
+           }
+          }
+         ],
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "blue",
+            "value": 1
+           },
+           {
+            "color": "red",
+            "value": 2
+           },
+           {
+            "color": "orange",
+            "value": 3
+           },
+           {
+            "color": "red",
+            "value": 10
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "green watching · blue working on an incident · orange paused · red gave up / Mac not reporting"
+      },
+      {
+       "id": 37,
+       "type": "text",
+       "title": "Autopilot links",
+       "gridPos": {
+        "x": 18,
+        "y": 5,
+        "w": 6,
+        "h": 4
+       },
+       "options": {
+        "mode": "markdown",
+        "content": "**[Every run, in detail](https://${ANVIL_TAILNET_HOST}:8446)** (tailnet): result, alerts, report, each tool call and its output.\n\nPause / resume / re-arm: `https://status.${ANVIL_DOMAIN}/autopilot?code=…`"
+       }
+      },
+      {
+       "id": 1,
+       "type": "row",
+       "title": "Sites (probed through Cloudflare every 30 s)",
+       "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 24,
+        "h": 1
+       },
+       "collapsed": false
+      },
+      {
+       "id": 2,
+       "type": "state-timeline",
+       "title": "Up (1) / down (0) per site",
+       "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 24,
+        "h": 9
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "probe_success{job=~\"sites|overall\"}",
+         "legendFormat": "{{instance}}"
+        }
+       ],
+       "fieldConfig": {
+        "defaults": {
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "red",
+            "value": null
+           },
+           {
+            "color": "green",
+            "value": 1
+           }
+          ]
+         },
+         "color": {
+          "mode": "thresholds"
+         },
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "down"
+            },
+            "1": {
+             "text": "up"
+            }
+           }
+          }
+         ]
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 3,
+       "type": "timeseries",
+       "title": "Response time per site",
+       "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 8
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "probe_duration_seconds{job=\"sites\"}",
+         "legendFormat": "{{instance}}"
+        }
+       ],
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s"
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 20,
+       "type": "row",
+       "title": "Cluster: every service, bot and job (kube-state-metrics)",
+       "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 24,
+        "h": 1
+       },
+       "collapsed": false
+      },
+      {
+       "id": 21,
+       "type": "stat",
+       "title": "Services not fully ready",
+       "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 6,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "count((kube_deployment_spec_replicas{namespace!~\"$hide\"} - kube_deployment_status_replicas_available{namespace!~\"$hide\"}) > 0 or (kube_statefulset_replicas{namespace!~\"$hide\"} - kube_statefulset_status_replicas_ready{namespace!~\"$hide\"}) > 0) or vector(0)",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "red",
+            "value": 1
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "Deployments/StatefulSets with fewer ready copies than wanted. Calls after 10 min (ServiceUnavailable)."
+      },
+      {
+       "id": 22,
+       "type": "stat",
+       "title": "Pods that can't start",
+       "gridPos": {
+        "x": 6,
+        "y": 28,
+        "w": 6,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "count(kube_pod_container_status_waiting_reason{reason=~\"CreateContainerConfigError|CreateContainerError|ImagePullBackOff|ErrImagePull|InvalidImageName|CrashLoopBackOff|RunContainerError\",namespace!~\"$hide\"} == 1) or vector(0)",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "red",
+            "value": 1
+           }
+          ]
+         }
+        },
+        "overrides": []
+       },
+       "description": "Missing secret, bad image, crash loop... Calls after 10 min (PodCannotStart)."
+      },
+      {
+       "id": 23,
+       "type": "stat",
+       "title": "Restarts (last hour)",
+       "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 6,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "sum(increase(kube_pod_container_status_restarts_total{namespace!~\"$hide\"}[1h])) or vector(0)",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "background"
+       },
+       "fieldConfig": {
+        "defaults": {
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "green",
+            "value": null
+           },
+           {
+            "color": "red",
+            "value": 4
+           }
+          ]
+         }
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 24,
+       "type": "stat",
+       "title": "Pods running",
+       "gridPos": {
+        "x": 18,
+        "y": 28,
+        "w": 6,
+        "h": 4
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "count(kube_pod_status_phase{phase=\"Running\",namespace!~\"$hide\"} == 1)",
+         "instant": true
+        }
+       ],
+       "options": {
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ]
+        },
+        "colorMode": "value"
+       },
+       "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+       }
+      },
+      {
+       "id": 25,
+       "type": "state-timeline",
+       "title": "Every service: ready (green) / missing copies (red)",
+       "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 16,
+        "h": 20
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "kube_deployment_status_replicas_available{namespace!~\"$hide\"} >= bool kube_deployment_spec_replicas{namespace!~\"$hide\"}",
+         "legendFormat": "{{namespace}}/{{deployment}}"
+        },
+        {
+         "refId": "B",
+         "expr": "kube_statefulset_status_replicas_ready{namespace!~\"$hide\"} >= bool kube_statefulset_replicas{namespace!~\"$hide\"}",
+         "legendFormat": "{{namespace}}/{{statefulset}}"
+        }
+       ],
+       "options": {
+        "showValue": "never",
+        "rowHeight": 0.8
+       },
+       "fieldConfig": {
+        "defaults": {
+         "color": {
+          "mode": "thresholds"
+         },
+         "thresholds": {
+          "mode": "absolute",
+          "steps": [
+           {
+            "color": "red",
+            "value": null
+           },
+           {
+            "color": "green",
+            "value": 1
+           }
+          ]
+         },
+         "mappings": [
+          {
+           "type": "value",
+           "options": {
+            "0": {
+             "text": "not ready"
+            },
+            "1": {
+             "text": "ready"
+            }
+           }
+          }
+         ]
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 28,
+       "type": "table",
+       "title": "Gone: services that existed in the last 7 days but don't now",
+       "gridPos": {
+        "x": 16,
+        "y": 32,
+        "w": 8,
+        "h": 20
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "description": "A Deployment/StatefulSet that was running at some point in the last 7 days and no longer exists (deleted, renamed, or lost). Empty is good. Uses the hide filter at the top (default: test namespaces zz-*).",
+       "targets": [
+        {
+         "refId": "A",
+         "instant": true,
+         "format": "table",
+         "expr": "max by (namespace, deployment) (max_over_time(kube_deployment_spec_replicas{namespace!~\"$hide\"}[7d])) unless on (namespace, deployment) kube_deployment_spec_replicas"
+        },
+        {
+         "refId": "B",
+         "instant": true,
+         "format": "table",
+         "expr": "max by (namespace, statefulset) (max_over_time(kube_statefulset_replicas{namespace!~\"$hide\"}[7d])) unless on (namespace, statefulset) kube_statefulset_replicas"
+        }
+       ],
+       "transformations": [
+        {
+         "id": "merge"
+        },
+        {
+         "id": "organize",
+         "options": {
+          "excludeByName": {
+           "Time": true
+          },
+          "renameByName": {
+           "Value": "copies wanted",
+           "Value #A": "copies wanted",
+           "Value #B": "copies wanted"
+          }
+         }
+        }
+       ],
+       "options": {
+        "showHeader": true,
+        "footer": {
+         "show": false
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "noValue": "nothing gone"
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 26,
+       "type": "timeseries",
+       "title": "Container restarts (per 15 min)",
+       "gridPos": {
+        "x": 0,
+        "y": 52,
+        "w": 12,
+        "h": 8
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "sum by (namespace, pod) (increase(kube_pod_container_status_restarts_total{namespace!~\"$hide\"}[15m])) > 0",
+         "legendFormat": "{{namespace}}/{{pod}}"
+        }
+       ],
+       "fieldConfig": {
+        "defaults": {
+         "min": 0
+        },
+        "overrides": []
+       }
+      },
+      {
+       "id": 27,
+       "type": "timeseries",
+       "title": "Pods that can't start (by reason)",
+       "gridPos": {
+        "x": 12,
+        "y": 52,
+        "w": 12,
+        "h": 8
+       },
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+       },
+       "targets": [
+        {
+         "refId": "A",
+         "expr": "kube_pod_container_status_waiting_reason{reason=~\"CreateContainerConfigError|CreateContainerError|ImagePullBackOff|ErrImagePull|InvalidImageName|CrashLoopBackOff|RunContainerError\",namespace!~\"$hide\"} == 1",
+         "legendFormat": "{{namespace}}/{{pod}}: {{reason}}"
+        }
+       ],
+       "fieldConfig": {
+        "defaults": {
+         "min": 0
+        },
+        "overrides": []
+       }
+      }
+     ],
+     "templating": {
+      "list": [
+       {
+        "name": "hide",
+        "label": "hide namespaces (regex)",
+        "type": "textbox",
+        "query": "zz-.*",
+        "current": {
+         "text": "zz-.*",
+         "value": "zz-.*"
+        },
+        "description": "Namespaces left out of the Cluster panels. Default zz-.* = throwaway test namespaces only. Clear it to see everything."
+       }
+      ]
+     }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alerting-grafana
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 1Gi } }
+---
+# Fixed ClusterIP: the node's `tailscale serve --https=3443` points at it (Butane tailscale-bootstrap).
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-grafana
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: alerting
+spec:
+  clusterIP: 10.43.200.94
+  selector: { app: alerting-grafana }
+  ports: [{ name: http, port: 3000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-grafana
+  labels: { app.kubernetes.io/name: alerting-grafana, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: alerting
+spec:
+  # Off by default (2026-10-27): ~230 MB the 8 GB node needs more. `scripts/node.sh grafana on` when you want the
+  # dashboards, `... off` after. A deploy of alerting turns it off again.
+  replicas: 0
+  strategy: { type: Recreate }   # RWO data volume (SQLite)
+  selector: { matchLabels: { app: alerting-grafana } }
+  template:
+    metadata: { labels: { app: alerting-grafana, app.kubernetes.io/name: alerting-grafana, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5494, runAsGroup: 5494, fsGroup: 5494 }
+      containers:
+        - name: grafana
+          image: docker.io/grafana/grafana:13.2.4
+          env:
+            - { name: GF_SERVER_ROOT_URL, value: "https://${ANVIL_TAILNET_HOST}:3443/" }
+            - { name: GF_PATHS_DATA, value: /var/lib/grafana }
+            - { name: GF_PATHS_PROVISIONING, value: /etc/grafana/provisioning }
+            - { name: GF_AUTH_ANONYMOUS_ENABLED, value: "true" }
+            - { name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Editor }
+            - { name: GF_SECURITY_ADMIN_USER, value: admin }
+            - { name: GF_SECURITY_ADMIN_PASSWORD, valueFrom: { secretKeyRef: { name: grafana-admin, key: GRAFANA_ADMIN_PASSWORD } } }
+            - { name: GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH, value: /var/lib/grafana-dashboards/anvil-overview.json }
+            - { name: GF_ANALYTICS_REPORTING_ENABLED, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false" }
+            - { name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES, value: "false" }
+            - { name: GF_NEWS_NEWS_FEED_ENABLED, value: "false" }
+            - { name: GF_PLUGINS_PREINSTALL_DISABLED, value: "true" }
+            - { name: GF_LOG_MODE, value: console }
+            - { name: GOMEMLIMIT, value: "300MiB" }   # Go GC soft target, well under the limit
+          ports: [{ name: http, containerPort: 3000 }]
+          readinessProbe: { httpGet: { path: /api/health, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /api/health, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 20m, memory: 256Mi }, limits: { memory: 425Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/grafana }
+            - { name: tmp, mountPath: /tmp }
+            - { name: provisioning, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml, subPath: datasources.yaml }
+            - { name: provisioning, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml, subPath: dashboards.yaml }
+            - { name: dashboards, mountPath: /var/lib/grafana-dashboards }
+      volumes:
+        - { name: data, persistentVolumeClaim: { claimName: alerting-grafana } }
+        - { name: tmp, emptyDir: {} }
+        - { name: provisioning, configMap: { name: alerting-grafana-provisioning } }
+        - { name: dashboards, configMap: { name: alerting-grafana-dashboards } }
+---
+# Prometheus's own identity, allowed only to list the pods in this namespace (to find the node exporters).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: alerting-prometheus
+  namespace: alerting
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alerting-prometheus
+  namespace: alerting
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  - { apiGroups: [""], resources: [pods], verbs: [get, list, watch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alerting-prometheus
+  namespace: alerting
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: alerting-prometheus }
+subjects: [{ kind: ServiceAccount, name: alerting-prometheus, namespace: alerting }]
+---
+# ...and the Traefik pods in kube-system (the server's and any pool's direct-mode one), for the traefik job.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: alerting-prometheus-traefik
+  namespace: kube-system
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  - { apiGroups: [""], resources: [pods], verbs: [get, list, watch] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: alerting-prometheus-traefik
+  namespace: kube-system
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: alerting-prometheus-traefik }
+subjects: [{ kind: ServiceAccount, name: alerting-prometheus, namespace: alerting }]
+---
+# The nodes' own figures for the capacity alerts, with NO host access: inside a container /proc/stat, /proc/meminfo and
+# /proc/pressure already show the whole node (steal included), and the container's root filesystem sits on the node's
+# disk, so its free space is the node's. An ordinary pod per node, on its pod IP; ~10-15 MB.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alerting-node-exporter
+  namespace: alerting
+  labels: { app.kubernetes.io/name: alerting-node-exporter, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+spec:
+  selector: { matchLabels: { app: alerting-node-exporter } }
+  template:
+    metadata: { labels: { app: alerting-node-exporter, app.kubernetes.io/name: alerting-node-exporter, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      tolerations: [{ operator: Exists }]   # every node, the light node and pools included
+      securityContext: { runAsNonRoot: true, runAsUser: 5497, runAsGroup: 5497 }
+      containers:
+        - name: node-exporter
+          image: prom/node-exporter:v1.9.1
+          args:
+            - --web.listen-address=:9101
+            - --collector.disable-defaults
+            - --collector.cpu
+            - --collector.meminfo
+            - --collector.loadavg
+            - --collector.pressure
+            - --collector.filesystem
+            - --collector.filesystem.mount-points-exclude=^/.+   # only "/": the container's root, on the node's disk
+            - --collector.filesystem.fs-types-exclude=^(tmpfs|proc|sysfs)$   # the default skips overlay, which "/" is
+          ports: [{ name: metrics, containerPort: 9101 }]
+          readinessProbe: { tcpSocket: { port: 9101 }, periodSeconds: 10 }
+          livenessProbe: { tcpSocket: { port: 9101 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 48Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+
+---
+# MariaDB replication status for the moved-database alerts: atlas and any moved project's own server, through
+# Prometheus's `mariadb` job (multi-target /probe). Login atlas_monitor: status only (PROCESS, BINLOG/SLAVE MONITOR), no data,
+# at most 3 connections. ~15 MB.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerting-mysqld-exporter
+  namespace: alerting
+  labels: { app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+spec:
+  selector: { app: alerting-mysqld-exporter }
+  ports: [{ name: http, port: 9104, targetPort: 9104 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alerting-mysqld-exporter
+  namespace: alerting
+  labels: { app.kubernetes.io/name: alerting-mysqld-exporter, app.kubernetes.io/part-of: alerting, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+spec:
+  selector: { matchLabels: { app: alerting-mysqld-exporter } }
+  template:
+    metadata: { labels: { app: alerting-mysqld-exporter, app.kubernetes.io/name: alerting-mysqld-exporter, app.kubernetes.io/part-of: alerting, app.kubernetes.io/component: monitoring } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5496, runAsGroup: 5496 }
+      containers:
+        - name: exporter
+          image: prom/mysqld-exporter:v0.20.0
+          args: ["--config.my-cnf=/etc/exporter/my.cnf", "--collect.slave_status", "--no-collect.info_schema.innodb_cmp", "--no-collect.info_schema.innodb_cmpmem", "--no-collect.global_variables"]
+          ports: [{ name: http, containerPort: 9104 }]
+          readinessProbe: { httpGet: { path: /, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /, port: http }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 10m, memory: 16Mi }, limits: { memory: 64Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          volumeMounts: [{ name: cnf, mountPath: /etc/exporter, readOnly: true }]
+      volumes: [{ name: cnf, secret: { secretName: mysqld-exporter } }]

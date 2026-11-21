@@ -1,0 +1,60 @@
+---
+title: Restore a database
+description: Replace one project's database from a dump (off-site backup or restore bundle) without touching the others.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Restores are **per project**: `restore-db` replaces one database in the shared MariaDB and leaves every other
+project alone.
+
+<Steps>
+
+1. **Get the dump** with an **admin** key from your laptop (the server's own key can't read the bucket):
+
+   ```sh
+   # bucket layout: daily/<YYYY-MM-DD>/<source>/… (30 days), monthly/<YYYY-MM>/<source>/… (365 days)
+   aws s3 cp --endpoint-url https://s3.fr-par.scw.cloud \
+     s3://<backup-bucket>/daily/<date>/mariadb/<db>.sql.gz .data/<ns>/db.sql.gz
+   ```
+
+   The nightly job writes one `<db>.sql.gz` per database under `daily/<date>/mariadb/` (and `monthly/<YYYY-MM>/mariadb/` on the 1st).
+
+   The dump must contain `CREATE DATABASE` / `USE` (i.e. `mariadb-dump --databases <db>`), which the nightly job's
+   dumps do.
+
+2. **Stop writers if it matters**: for a full rollback of data, scale the app to 0 first
+   (`scripts/node.sh kubectl -n <ns> scale deploy/<name> --replicas=0`) so nothing writes during the load.
+
+3. **Restore**:
+
+   ```sh
+   scripts/node.sh restore-db <ns>
+   ```
+
+   It drops and reloads only that project's database, applies `apps/<ns>/post-restore.sql` if present (e.g. an
+   index the dump doesn't carry), and re-runs `atlas-users` so the `_rw`/`_ro` grants are back.
+
+4. **Bring the app back** (`scripts/node.sh deploy <ns>` restores the replica count from the manifest) and check
+   `/database` and `/cluster` on the status host.
+
+</Steps>
+
+## SQLite apps
+
+If an app keeps a SQLite file and has its own `server-backup sqlite` job, download its folder from the same date, then
+unpack it into the app's volume with the app stopped:
+
+```sh
+scripts/node.sh load-pvc <ns> <pvc> <uid> <file.tgz> [member…]   # into a PVC with no running pod
+```
+
+<Aside type="tip" title="Test restores">
+A backup you have never restored is a hope. Restore into a `zz-…` copy now and then (and delete it the same
+session), or let anvil's planned `80-verify` step do a restore test.
+</Aside>
+
+## A whole new server
+
+On a rebuild, every project is restored this way from the restore bundle (`.data/<ns>/db.sql.gz`) after
+`make apps`: see [Rebuild the server](/operations/rebuild-server/).

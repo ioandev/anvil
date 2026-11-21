@@ -1,0 +1,103 @@
+---
+title: Quickstart (about an hour)
+description: From a domain and a few accounts to a running anvil with the demo app, in about an hour (mostly waiting for DNS), and back to nothing in minutes.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+Ten Claude Code skills stand up anvil on a fresh server: Cloudflare zone, server, shared stack, demo app, phone
+alerts, autopilot, then a full verification. Each step checks its own result and is safe to re-run.
+`99-teardown` removes everything again.
+
+## What you need
+
+| Thing | Used for |
+|---|---|
+| A domain you own | becomes a Cloudflare zone; the platform serves `demo.`, `status.` and `www.` on it |
+| Scaleway account and API key (**create it without an expiry date**) | the server, Object Storage (backups), container registry, Transactional Email |
+| Cloudflare account and an API token (scopes in [Variables](/reference/variables/#part-1-you-set-these)) | DNS, proxy, Origin CA certificates, origin pulls |
+| Twilio account with a voice-capable number, an API key and secret | phone calls |
+| Tailscale tailnet and a reusable, non-ephemeral auth key | the internal UIs (Grafana, Prometheus, Alertmanager, Dozzle) |
+| An Anthropic API key **with a spend limit** (or a subscription token from `claude setup-token`) | the autopilot |
+| An always-on home machine with Docker, on the tailnet, reachable by key-based SSH (a Mac mini works) | the watchdog, the autopilot, the vault |
+| Your laptop (macOS or Linux) | `terraform` ≥ 1.8, `sops` ≥ 3.9, `age`, `python3` ≥ 3.11 with PyYAML, `podman`, `openssl`, `ssh`, `curl`, `jq`, `git` (`brew install terraform sops age podman jq` on macOS) |
+| Optional: Namecheap API access | lets the bootstrap switch the nameservers for you |
+
+## Your own copy first
+
+anvil is a template: you don't install from it directly, you **make your own private copy and install from that**.
+Your copy becomes your platform's repository: the bootstrap commits its encrypted settings, passwords, certificates
+and the server's Terraform state into it (`*.sops`, readable only with your age key), and your own apps go under
+`apps/` and `sites.yaml`. Keep it **private**: the encryption protects the values, privacy protects the rest.
+
+```sh
+# 1. a private repository of your own (GitHub: "Use this template" → Private, or any git host), then:
+git clone git@github.com:<you>/<your-platform>.git && cd <your-platform>
+# 2. remember where anvil itself lives, to take its fixes later
+git remote add upstream https://github.com/ioandev/anvil.git
+```
+
+**Updates later:** `git pull upstream main`, then `make check`. Your deployment's files (`*.sops`, `anvil.env`, your
+`apps/`) are separate from anvil's code, so updates rarely conflict; the usual place for a conflict is `sites.yaml`,
+where both add entries. Then redeploy what changed (`scripts/node.sh deploy <ns>`, `make plan` for infrastructure).
+One repository per platform: a second platform (another domain, another server) is a second private copy with its own
+`ANVIL_NAME`, and both can share one home machine (every folder, container and port there is named after the platform).
+
+## Run it
+
+```sh
+cd <your-platform>                  # your private copy (above)
+scripts/anvil-secrets init          # creates anvil.env, your age key and every generated secret
+$EDITOR anvil.env                   # fill in part 1 (accounts and keys) yourself: never paste them into the chat
+claude                              # then: "run the anvil bootstrap skills in order"
+```
+
+<Steps>
+
+1. **`00-preflight`**: tools, accounts and tokens checked with read-only calls; prints the cost before anything exists.
+2. **`10-secrets`**: age key, generated passwords and codes, origin-pull CA, SSH key. **Stops** so you can copy the
+   age key into your password manager.
+3. **`20-cloudflare`**: zone, nameservers (Namecheap API or a `HUMAN.md` task for you), waits for activation **and**
+   the edge certificate, issues the Origin CA certificate.
+4. **`30-infra`**: Terraform. You read the plan together; the server comes up with k3s, Tailscale and swap.
+5. **`40-platform`**: registry, backup bucket and write-only key, images, Secrets, the shared stack, a first backup.
+6. **`50-demo-app`**: the demo app, the DNS cutover, checks from outside through a Cloudflare IP.
+7. **`60-alerts`**: one test call (after you say yes) and the watchdog on the home machine.
+8. **`70-autopilot`**: the vault, the autopilot, and a live break-and-fix test plus an unfixable one.
+9. **`80-verify`**: everything green, including a restore test; writes a report.
+
+</Steps>
+
+Details of each step, what needs you and how it checks itself: [Bootstrap skills](/quickstart/bootstrap-skills/).
+
+## Where the hour goes
+
+Most of it is waiting: the Cloudflare zone activating after the nameserver switch (minutes to hours, outside
+anvil's control), the edge certificate, the Flatcar image import (a few minutes for ~600 MB), the first boot.
+The rest is a few `make` targets and the checks.
+
+<Aside type="caution" title="Things only you can do">
+Typing your account keys into `anvil.env`; saving the age key; moving nameservers if you gave no Namecheap token;
+saying yes to the test call and the live autopilot test; confirming a teardown by the platform's name. Anything the
+agent can't or mustn't do lands in `HUMAN.md` with exact steps.
+</Aside>
+
+## Afterwards
+
+| Where | What |
+|---|---|
+| `https://demo.<your-domain>/` | the [demo app](/quickstart/demo-app/): sign the guestbook, then break it |
+| `https://status.<your-domain>/overall?code=<STATUS_CODE>` | the platform's health in one line ([Status webhooks](/components/status-webhooks/)) |
+| `https://status.<your-domain>/autopilot?code=…` | the autopilot's state and its runs |
+| `https://<server>.<tailnet>.ts.net:3443` | Grafana (tailnet only) |
+
+Everyday commands: `make check`, `make apps`, `scripts/node.sh deploy <ns>`, `scripts/new-site init|plan|apply`,
+`scripts/node.sh kubectl …`.
+
+## Cost and tearing down
+
+An hour up and torn down costs well under €1 (under €0.10 of Scaleway). Running it for good is roughly €35 a month
+for the server and IP, approximate and at the time of writing. [Costs](/costs/) has the breakdown. `99-teardown`
+deletes the server, IP, buckets (after asking, because they hold the only off-site backups), registry, DNS records
+and the home machine's containers, then checks nothing billable is left. Keep `anvil.env.sops` and the repo: with
+them (and the age key) the platform can be rebuilt.

@@ -1,0 +1,95 @@
+---
+title: Alert rules
+description: Every Prometheus alert rule in the platform, its condition and wait, and what it means.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+From `platform/alerting/app.yaml` (ConfigMap `alerting-rules`). The **Level** column is the rule's `severity`, which
+decides where it goes ([three levels](/components/monitoring/#three-alert-levels)): **phone** (`critical`, and
+anything that isn't `notify`, `warning` or `none`) calls through twilio-alert; **latch** (`notify`) writes one line a
+day per alert and site to the error latch; **nowhere** (`warning`) is only shown. Resolved alerts never call.
+
+## Availability
+
+| Alert | Fires when | Waits | Level |
+|---|---|---|---|
+| `Watchdog` | always (`vector(1)`, `severity: none`): Alertmanager's heartbeat to the status webhook, never to the phone | n/a | heartbeat |
+| `SiteDown` | a probed URL (job `sites`) fails, unless its namespace had a workload created or changed in the last 10 min | 5 min | phone |
+| `ServerHealthRed` | the status webhook's `/overall` is red (disk, database, backups, cluster) | 5 min | phone |
+| `AnvilDemoWorkerStuck` | the demo worker's heartbeat (`anvil_demo_worker_last_run_timestamp_seconds`) is older than 120 s: alive but not working | 2 min | phone (`page`) |
+| `ServiceUnavailable` | a Deployment has fewer available replicas than wanted (not if created/changed in the last 10 min) | 5 min | phone |
+| `StatefulSetUnavailable` | same for a StatefulSet (e.g. the shared MariaDB) | 5 min | phone |
+| `PodCannotStart` | a container waits with `CreateContainerConfigError`, `CreateContainerError`, `ImagePullBackOff`, `ErrImagePull`, `InvalidImageName`, `CrashLoopBackOff` or `RunContainerError` (pods older than 10 min) | 5 min | phone |
+| `PodRestartingOften` | more than 3 restarts in 30 min, for pods that still exist and are older than 10 min | none | phone |
+| `JobFailed` | a Job failed; fires for 6 h after it started, then resolves by itself | none | phone |
+| `MacOffline` | the autopilot's heartbeat (`autopilot_last_heartbeat_seconds`) is older than 10 min: the home machine is off, asleep, locked after a reboot, or Docker is down | none | phone |
+| `ProbesMissing` | `probe_success` for the `sites` or `overall` job, or kube-state-metrics, is absent (blind is not healthy) | 5 min | phone |
+
+## Capacity and failures
+
+Node figures from `alerting-node-exporter`, site figures from Traefik's `traefik_service_requests_total` and its
+duration histogram ([how](/components/monitoring/#capacity-alerts-that-come-before-failures)). "Failed" = 5xx, 429,
+408; never 404, 401, 403 or websocket closes (`code="0"`).
+
+| Alert | Fires when | Waits | Level |
+|---|---|---|---|
+| `NodeCPUHigh` | `100 × (1 − Σ idle ÷ Σ all)` per node over 65 (steal counts as busy) | 15 min | latch |
+| `NodeCPUStealHigh` | steal over 30% of a node's CPU time (10-minute rate) | 30 min | latch |
+| `NodeMemoryLow` | `node_memory_MemAvailable_bytes` under 600 MB | 10 min | latch |
+| `NodeMemoryPressure` | memory stall time (`node_pressure_memory_stalled_seconds_total`) over 10% | 10 min | latch |
+| `NodeSwapHeavy` | over 1,500 MB of swap in use | 15 min | latch |
+| `NodeDiskLow` | under 3 GB free on `/` | 10 min | latch |
+| `SiteErrorsHigh` | over 5% of a site's requests failed (10-minute rate), with at least 0.2 requests/s | 10 min | latch |
+| `SiteErrorsCritical` | over 20% failed (5-minute rate), with at least 1 request/s | 5 min | **phone** |
+| `SiteSlow` | a site's 95th percentile over 2 s (10-minute rate), with at least 0.2 requests/s | 15 min | latch |
+| `ProbeSlow` | a probe (job `sites`) takes over 5 s | 10 min | latch |
+| `ContainerOOMKilled` | a container restarted in the last 15 min and its last termination was `OOMKilled` | none | latch |
+
+## Scale-out
+
+Only meaningful while a [pool](/operations/scale-out/) is up or a database is moved. The replication figures come from
+`alerting-mysqld-exporter` (Prometheus job `mariadb`, probing atlas and every movable project's own server, logged in
+as `atlas_monitor`: status only).
+
+| Alert | Fires when | Waits | Level |
+|---|---|---|---|
+| `PoolNodeDown` | a pool node (`<name>-<pool>-<n>`, not the light node) is not Ready: if a site lives there, `scripts/pool rescue <pool>` | 2 min | phone |
+| `MovedDatabaseSafetyNetStopped` | atlas stopped following the moved database (its IO or SQL thread is not running): no live copy if the pool node dies | 3 min | phone |
+| `MovedDatabaseReplicationStopped` | the project's own server stopped following atlas, before a cutover (nothing lost) | 3 min | nowhere |
+| `MovedDatabaseReplicaLag` | any copy over 30 s behind | 5 min | nowhere |
+
+health-watch also writes a line a day to the error latch for every pool node that has existed for over 12 hours
+("billed hourly"), so a forgotten pool can't run up a bill quietly.
+
+## Ignoring work in progress
+
+The "ignore work in progress" part, as used by `SiteDown` and `ServiceUnavailable`:
+
+```text
+unless on (namespace, deployment) (
+  (time() - kube_deployment_created < 600)
+  or (changes(kube_deployment_metadata_generation[10m]) > 0)
+)
+```
+
+## App rules (examples from the original platform)
+
+The original platform also scrapes one real app's own metrics (a Spring Boot backend's `/actuator/prometheus` on its management
+port) and probes it from inside the cluster. These are app-specific and not part of anvil, but they show the
+pattern of alerting on **business health**, not just "is it up":
+
+| Example | Fires when | Waits |
+|---|---|---|
+| app down through Cloudflare / backend down in-cluster | the app's public URLs, or its backend inside the cluster, fail | 2 min |
+| metrics down | Prometheus can't scrape the app's metrics | 5 min |
+| relay stuck | the oldest queued job is older than 10 min | 5 min |
+| email stuck | the oldest unsent email is older than 1 h | none |
+| bot not polling | a Discord bot hasn't polled for 5 min (silence it when the bot is off on purpose) | none |
+| heap high | JVM heap over 90 % | 5 min |
+| remote offline | a helper on the second machine isn't connected, seen both from a probe and from the app's own metric | 5 min |
+
+<Aside type="tip">
+When you add a rule, add the matching check to `/cluster` or a status hook if it should also turn the status pages
+red, and make sure it ignores work in progress the same way, or deploys will page you.
+</Aside>

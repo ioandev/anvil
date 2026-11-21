@@ -1,0 +1,31 @@
+---
+import Diagram from './Diagram.astro'
+const L = 20, W = 320, CX = L + W / 2
+const boxes = [
+  { x: L, y: 20, w: W, h: 64, title: 'Visitor', lines: ['https://example.com/…'] },
+  { x: L, y: 124, w: W, h: 82, title: 'Cloudflare edge', lines: ['edge certificate, DDoS protection, cache', 'proxied (orange-cloud) DNS record'] },
+  { x: L, y: 246, w: W, h: 82, title: 'Scaleway security group', lines: ['80/443 only from Cloudflare IPv4 ranges', 'SSH on a custom port, key-only'] },
+  { x: L, y: 368, w: W, h: 100, kind: 'accent', title: 'Traefik (k3s, via ServiceLB)', lines: ['requires a client cert signed by YOUR CA', "serves the zone's Origin CA certificate", 'www → apex 301, per-IP rate limits'] },
+  { x: L, y: 508, w: W, h: 82, title: '<project>-web Service → pod', lines: ['own UID/GID, readiness + liveness probes', 'DB: atlas-mariadb.atlas:3306'] },
+  { x: 380, y: 246, w: 225, h: 82, kind: 'danger', title: 'Anyone else', lines: ['connects to the origin IP', 'dropped by the firewall'] },
+  { x: 380, y: 368, w: 225, h: 100, kind: 'danger', title: 'Another CF customer', lines: ['their zone points at your IP,', 'but has no cert from your CA:', 'TLS handshake refused'] },
+]
+const edges = [
+  { d: `M${CX},84 V122` },
+  { d: `M${CX},206 V244`, kind: 'accent' },
+  { d: `M${CX},328 V366`, kind: 'accent' },
+  { d: `M${CX},468 V506` },
+  { d: 'M380,287 H342', kind: 'danger' },
+  { d: 'M380,418 H342', kind: 'danger' },
+]
+const labels = [
+  { x: CX + 12, y: 108, text: 'HTTPS (Cloudflare edge cert)' },
+  { x: CX + 12, y: 230, text: 'HTTPS + client cert (origin pull)' },
+  { x: CX + 12, y: 352, text: 'source IP is Cloudflare' },
+  { x: CX + 12, y: 492, text: 'XFF: visitor, 10.42.x.x · CF-Connecting-IP' },
+]
+---
+<Diagram id="req" width={620} height={606} boxes={boxes} edges={edges} labels={labels}
+  title="Request path"
+  desc="A visitor reaches Cloudflare, which connects to the server through a firewall that only admits Cloudflare's IP ranges; Traefik then requires a client certificate signed by your own CA before routing to the app."
+  caption="Request path: two independent locks (source IP and client certificate) mean only your Cloudflare zones can reach the origin." />

@@ -1,0 +1,50 @@
+---
+title: 'Decision: labels, not renames'
+description: Why namespaces and Services keep their names and every object gets the standard Kubernetes labels instead.
+---
+
+**Status:** accepted (2026-10-27).
+
+## Context
+
+Grouping by project or component (Grafana panels, alerts, NetworkPolicies) needed a consistent scheme. One option
+was renaming namespaces and Services into a new convention. Names are also in-cluster hostnames that apps have baked
+in, and a Deployment's selector can't change.
+
+## Decision
+
+**Keep names**: namespace = project, Service = `<project>-<component>` (unique across the cluster). **Add the
+standard labels** to every object:
+
+| Label | Value |
+|---|---|
+| `app.kubernetes.io/part-of` | the project (namespace) |
+| `app.kubernetes.io/name` | the workload (on workloads and pod templates) |
+| `app.kubernetes.io/component` | `web`, `server`, `bot`, `job`, `backup`, `database`, `monitoring`, `app` |
+| `app.kubernetes.io/version` | the image tag |
+| `app.kubernetes.io/managed-by` | `anvil` |
+| `anvil/tier` | `platform` or `app` |
+
+Selectors stay as they are (`app: <name>`). Backup CronJobs carry `component: backup`, which is how `backup-watch`,
+health-watch and `/backups` find them without a hard-coded list. Cross-namespace calls use full names (`<service>.<ns>.svc`). anvil has
+the labels from day one; the original server added them to all 227 objects in one change, proven to change nothing else.
+
+## Consequences
+
+- + No renamed hostnames, no broken baked-in URLs, no selector migrations.
+- + Grafana and alert rules can group by project/component; label-based NetworkPolicies become possible.
+- − Adding labels to pod templates restarts every workload once (a rolling restart; short gaps for singletons).
+- − Two sources of identity (name and labels) to keep consistent; `scripts/templates/app.yaml.tpl` carries them.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| Rename everything to a new convention | risky (hostnames baked into images, immutable selectors) for no functional gain |
+| Do nothing | no reliable way to group per project or component |
+
+## How it was decided
+
+The owner asked whether renaming namespaces and Services into one scheme would be better. Claude recommended against
+it: renames are downtime for no gain (hostnames baked into images, immutable selectors). The labels were added to all
+227 objects of the original platform in one change; a server-side dry run showed label additions only.

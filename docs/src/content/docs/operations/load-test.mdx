@@ -1,0 +1,158 @@
+---
+title: Load-test a site
+description: A throwaway copy of a site on its pool, with generated data and its own database, hit by k6 from a temporary machine while every real site is watched - how to run it, keep it safe and read the results, plus a ceiling test's reference numbers.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components'
+
+`scripts/loadtest` answers "how much traffic can this site take, and what gives way first?" without risking the real
+site. It deploys a **copy** of the site on the project's [pool](/operations/scale-out/), with production's image but
+its **own** MariaDB filled with generated data, behind a password; runs [k6](https://k6.io) against it from a
+temporary machine in the same region; watches every real site while it runs; and writes a report. Before publishing a
+site or a launch, also read the rules in the repo's `CAPACITY.md`, which come from the test below.
+
+<Aside type="caution" title="Billed by the hour">
+Both the pool and the k6 machine are billed by the hour, every started hour in full. Plan the tests in one pool
+session, and never pick a bigger pool or k6 machine without the owner's yes (size, hourly price, and that a resize
+restarts the server): [the money rules](/operations/scale-out/#the-money-rules).
+</Aside>
+
+## The commands
+
+| Command | Does |
+|---|---|
+| `scripts/loadtest <ns> up [--rows N]` | deploys the copy on the pool (namespace `<ns>-loadtest`, labelled `anvil/loadtest=true`), fills its database with generated data, points its hostname at the server, prints the password |
+| `scripts/loadtest <ns> seed N` | refills the copy's database with N generated rows (drops what is there) |
+| `scripts/loadtest <ns> run [script] [KEY=VALUE …] [--keep] [--label=text]` | creates the k6 machine, runs `loadtest/<ns>/<script>.js` (default `mixed`) against the copy, writes the report, deletes the k6 machine (`--keep`: not) |
+| `scripts/loadtest <ns> scale web=N [worker=N]` | changes the copy's replicas between runs |
+| `scripts/loadtest <ns> status` | what exists, the password, the number of rows |
+| `scripts/loadtest <ns> down` | deletes the copy and its volumes (the pool stays) |
+
+`scripts/pool down` refuses while a load-test namespace exists.
+
+## Describing a site's copy: `loadtest:`
+
+On the project's entry in [`sites.yaml`](/reference/sites-yaml/#loadtest):
+
+| Key | Meaning |
+|---|---|
+| `host` | the copy's hostname (no probe on purpose: it usually doesn't exist) |
+| `manifest` | a template with `${LT_*}` placeholders (`LT_NS`, `LT_HOST`, `LT_PLACEMENT`, `LT_IMAGE`, `LT_MARIADB_IMAGE`, `LT_WEB_REPLICAS`) plus the usual `${ANVIL_*}`; a placeholder left unfilled stops the script |
+| `seed` | SQL that generates the data; `{N}` is replaced by the row count |
+| `k6` | the folder of k6 scripts (default `loadtest/<ns>`) |
+| `check` | a path that answers 200 once the copy works |
+| `rows` | the default row count (default 10,000) |
+| `image_from` | the production Deployment whose image the copy runs (default `<ns>-web`) |
+| `pool` | optional; otherwise the pool from the project's `move:` |
+
+The copy's namespace needs its own entry too, `scripted: true` (it has no `app.yaml`), with its own UID block.
+
+### The demo's copy
+
+| File | What |
+|---|---|
+| `apps/anvil-demo/loadtest.yaml.tpl` | its MariaDB (UID 6010, its own volume, no binary log), web (6011) and worker (6012), all on the demo pool; readiness a port check and the built-in `preStop` sleep; the per-visitor rate limit raised to 1,000,000 a minute; basic auth and `X-Robots-Tag: noindex, nofollow` on the Ingress |
+| `apps/anvil-demo/loadtest-seed.sql` | N approved guestbook entries (default 50,000 from `sites.yaml`), nothing from production; runs in the copy's own MariaDB, never on atlas |
+| `loadtest/anvil-demo/mixed.js` | readers (the guestbook page and the entries API) and writers (posting an entry): ramp over 3 minutes to `RATE` readers and `WRITE_RATE` posts a second, hold for `DURATION`, ramp down. Fails the run over 1% failed, pages p95 over 1.5 s or the API p95 over 0.5 s |
+| `loadtest/anvil-demo/ceiling.js` | the same visits as a **staircase** (`START`, `STEP`, `STEPS`, `STEP_TIME`, `WRITE_SHARE`) that stops itself (`abortOnFail`) once over 5% fail or the p95 passes 3 s, each held 30 s |
+| `loadtest/aggregate.py` | runs on the k6 machine: reduces k6's per-request CSV to 10-second buckets (requests, failures, status classes, latency percentiles per kind, users) |
+
+## Safe by construction
+
+- **Never production's database.** The copy has its own MariaDB on the pool with generated data; its login, root
+  password and the app's own generated secrets (`generate:`) are fresh random values, never production's. Generate
+  data that follows the app's rules, so the flows you test work without sign-ups or email (for a site with accounts:
+  sessions created directly in the data).
+- **Nothing leaves it**: no email sending (no SMTP host), no bots, no integrations.
+- **Behind a password and never indexed**: Traefik basic auth on the whole host (user `loadtest`, the password printed
+  by `up` and `status`; the auth secret holds exactly one key, or Traefik drops the route) and `noindex`.
+- **Its rate limit is raised**: every k6 request comes from one IP, so a per-visitor limit would measure itself.
+- **The real sites are watched.** Every 15 s during a run the script asks Prometheus for every real site's probe;
+  the first failure, or a probe over 8 s twice in a row, **stops k6 at once**. Every request still goes through
+  Cloudflare and the server's Traefik (the real path), so a heavy test slows the other sites: run at quiet hours and
+  ramp up gradually.
+- **A copy that can't start can't page anyone.** The cluster-wide alerts see every namespace and would phone after
+  10 minutes; `up` gives each Deployment 4 minutes, then scales it to 0, prints its log and stops.
+- **Silence what the test touches** in Alertmanager for its duration, `kube-system` included: on the original server
+  a router restart there during a test phoned the owner.
+
+## A run
+
+<Steps>
+
+1. `scripts/pool up demo` (if it isn't up), then `scripts/loadtest anvil-demo up`.
+2. A first, modest run: `scripts/loadtest anvil-demo run mixed RATE=50 WRITE_RATE=5 DURATION=5m`.
+3. Finding the limit: `scripts/loadtest anvil-demo run ceiling --label="1 web"`, then change **one thing**
+   (`scripts/loadtest anvil-demo scale web=3`, an index, a cache) and run the same staircase again with a new label.
+4. `scripts/loadtest anvil-demo down`, then `scripts/pool down demo`.
+
+</Steps>
+
+The k6 machine (`scripts/pool loadgen`, a POP2-2C-8G by default, outside the cluster) is created by `run` and
+deleted when it ends, even if the test fails, unless you pass `--keep`.
+
+## Reading the results
+
+Each run writes `docs/loadtests/<date>-<ns>-<script>.md` and a `.json` beside it. The report gives the requests (total
+and per second), the failure rate, latency (average, median, p95, p99, max) for all requests, pages, API reads and
+writes, every node's CPU and memory every 10 seconds, and k6's own summary. The JSON holds more: the settings and
+label, the replica counts, k6's 10-second series (requests, failures and status classes per kind), every 10-second
+sample (both nodes' steal and load, CPU and memory per workload of the copy and of Traefik) and the site watch's
+events.
+
+- **Clean capacity** is the busiest 10 seconds with no failures and every p95 low (the original test used 300 ms).
+  That's the number to plan with: keep the busiest expected minute at about **70%** of it.
+- **Watch latency, not errors**: errors come only after latency has already climbed.
+- **Look at the database's slow queries** under load (MariaDB's slow-query log) instead of guessing which query costs
+  most: on the original server one query without a covering index was most of the database's load.
+- One k6 machine is **one IP**: Cloudflare's and the site's per-IP limits can show up as 429s or challenges at the very
+  top. Use more than one machine for the very top (ask first: it's another server).
+
+## Reference results
+
+A ceiling test on the original server: nine runs on a production deployment's copy (a Next.js website, a Rust API and
+MariaDB behind Cloudflare and Traefik, generated data), in 1 h 19 min of pool time. Each run changed one thing and
+climbed the same staircase until k6 stopped itself.
+
+| Run | What changed | Clean requests/s | What limited it |
+|---|---|---|---|
+| 1 | production's setup: 4 cores, 1 website, 1 API, through the shared server | **284** | the website's readiness check rendered `/` with a 1 s timeout; under load it failed, the only website pod left rotation, 503 for everyone |
+| 2 | readiness: a port check | **232** | one Next.js process tops out at about 1.3 cores: pages 2–5 s, but **0% failed** |
+| 3 | 3 website pods | **463** | the 4-core server full |
+| 4 | 8 cores, 6 websites, 2 APIs | **763** | the server full; rendering pages took 4.9 of 8 cores |
+| 5 | a covering database index for the busiest query | **777** | the same; that query's database time fell 4.6-fold |
+| 6 | direct mode (the shared server out of the path) | **915** | the server full; its own Traefik killed for memory at the top |
+| 7 | a 1-second cache for anonymous pages | **2,346** | the uncached API and database; the website's CPU fell from 4.9 to 0.5 cores |
+| 8 | the public API cached for 1 second too | **2,794** | the server evenly full: Traefik, database, APIs |
+| 9 | 16 cores, 4 APIs (resized without asking: see the money rules) | **5,910** | Traefik terminating TLS behind Cloudflare (7.6 of 16 cores); at the very top also k6's own caps and the copy's per-IP limit |
+
+Run 2's lower number is the fix working: the site got slow instead of failing. The two lessons that matter most are
+run 1 (a health check turned "slow" into "down") and run 7 (a 1-second cache for anonymous pages tripled capacity on
+the same server; [Edge caching](/components/edge/#edge-caching) does that at Cloudflare). Capacity then grew about
+linearly with cores.
+
+### Why requests failed
+
+In every run, the first failed request came only after the CPU was full and requests had started to queue. Until
+then there were none: runs 2–5 had **1 failure in 527,765 requests**. Once requests queue, four different things turn
+the queue into errors:
+
+```text
+CPU full → requests queue (in Traefik, in the website, in the API's database pool)
+         → answers take seconds instead of milliseconds
+         → ┬ a health check with a short timeout calls a busy pod dead     → 503 for everyone (run 1; fixed)
+           ├ the router holds thousands of waiting requests in memory     → killed for memory: 502/520 (runs 6, 8)
+           ├ Cloudflare or the client stops waiting on 4–16 s answers     → 5xx, HTTP/2 stream resets (runs 7–9)
+           └ a rate limit meant for abuse meets a single test machine     → 429 (run 9: a test artefact)
+```
+
+So "no failed responses" takes two things: **headroom** (the busiest minute below the clean capacity) and **failing
+fast** when it's exceeded: a ceiling on how many requests may wait (Traefik's `inFlightReq` middleware just above the
+clean capacity's concurrency), which answers 503 with `Retry-After` at once, keeps the router's memory bounded and
+protects the other sites on the same Traefik. Also: health checks that never take a busy pod out, routers with
+enough memory for overload (sized from a test), several replicas, and alerts on latency before failures.
+
+Next time, record exact status codes (429, 502, 503, 520, 524 instead of classes) and use more than one k6 IP for the
+very top.
+
+The rules this produced are in the repo's `CAPACITY.md`; the stories are in [Lessons learned](/lessons/#capacity-and-load-tests).

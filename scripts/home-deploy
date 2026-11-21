@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Ship one home-machine component (mac/<component>/: watchdog, autopilot, openbao, backup-pull) to the home machine.
+#   scripts/home-deploy <component> [image ...]
+# Renders its files with ${ANVIL_*} from anvil.env, copies them to ~/$ANVIL_NAME-<component>/ on $ANVIL_HOME_SSH (named
+# after the platform, so one home machine can serve several platforms without their files or containers colliding) (only compose
+# files, scripts and configs: never source code), loads the named images there with `podman save | docker load` (the
+# home machine needs no registry login), then `docker compose up -d` if there is a compose file.
+# Its secrets (.env) are written separately by the bootstrap step, never copied from git in plaintext.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; . ./anvil.env; set +a
+c=${1:?component (watchdog, autopilot, openbao, backup-pull)}; shift
+[[ -d mac/$c ]] || { echo "no mac/$c"; exit 1; }
+: "${ANVIL_HOME_SSH:?set ANVIL_HOME_SSH in anvil.env}"
+out=$(mktemp -d); trap 'rm -rf "$out"' EXIT
+python3 -I - "$c" "$out" <<'PY'
+import pathlib, sys
+sys.path.insert(0, "scripts"); import anvil_env
+c, out = sys.argv[1], pathlib.Path(sys.argv[2])
+env = anvil_env.load()
+for f in pathlib.Path("mac", c).rglob("*"):
+    if not f.is_file() or f.name.endswith((".sops", ".env")) or f.name == ".gitignore":
+        continue
+    dst = out / f.relative_to(pathlib.Path("mac", c)); dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.write_text(anvil_env.expand(f.read_text(), env, where=str(f)))
+    except UnicodeDecodeError:   # a binary file (the vault's seal.key): copied byte for byte, never rendered
+        dst.write_bytes(f.read_bytes())
+    dst.chmod(f.stat().st_mode & 0o777)
+if c == "autopilot":   # the site config, rendered: the autopilot's fallback when its clone of the repo fails
+    (out / "autopilot.yaml").write_text(anvil_env.expand(pathlib.Path("autopilot.yaml").read_text(), env, where="autopilot.yaml"))
+PY
+D='export PATH=$PATH:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin'
+d="${ANVIL_NAME:?}-$c"   # the folder on the home machine
+ssh "$ANVIL_HOME_SSH" "mkdir -p ~/$d" </dev/null
+scp -q -r "$out"/. "${ANVIL_HOME_SSH}:$d/" </dev/null
+for img in "$@"; do
+  echo "loading $img"
+  podman pull -q --platform linux/arm64 "$img" >/dev/null 2>&1 || podman pull -q "$img" >/dev/null
+  podman save "$img" | ssh "$ANVIL_HOME_SSH" "$D; docker load" | tail -1
+done
+if [[ -f $out/docker-compose.yml ]]; then
+  ssh "$ANVIL_HOME_SSH" "$D; cd ~/$d && docker compose up -d" </dev/null
+fi
+if [[ -f $out/install.sh ]]; then
+  # backup-pull: schedule it once its .env (secrets, written separately) is there
+  ssh "$ANVIL_HOME_SSH" "test -f ~/$d/.env && bash ~/$d/install.sh || echo 'no ~/$d/.env yet: write it, then run ~/$d/install.sh'" </dev/null
+fi
+echo "home-deploy $c: done"

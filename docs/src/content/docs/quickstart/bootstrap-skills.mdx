@@ -1,0 +1,173 @@
+---
+title: Bootstrap skills
+description: The ten Claude Code skills that build anvil from nothing and tear it down again - what each does, what needs a person, and how it verifies itself.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+
+The skills live in `.claude/skills/<step>/SKILL.md`. Ask Claude Code to "run the anvil bootstrap skills in order";
+each one checks its own result before the next starts, can be re-run safely, and writes anything only a person can
+do into `HUMAN.md`. Every secret stays in `anvil.env` (gitignored, encrypted twin in git): the skills never print a
+value and never ask you to paste one into the chat.
+
+## 00-preflight: can we build, and what will it cost?
+
+Changes nothing. Reports one table: check · result · how to fix. A failed **required** line stops the bootstrap.
+
+| Check | How |
+|---|---|
+| Tools | `command -v` and versions: `terraform` ≥ 1.8, `sops` ≥ 3.9, `age` + `age-keygen`, `python3` ≥ 3.11 with PyYAML, `podman`, `openssl`, `ssh`, `curl`, `jq`, `git`; optional `scw`, `gh`. Never a `curl \| sh` installer without showing you first. |
+| `anvil.env` | `scripts/anvil-secrets missing` prints nothing; if the file is missing, `scripts/anvil-secrets init` creates it and you fill in part 1 |
+| Scaleway | read the project with the key → 200; and the key has **no expiry** (`expires_at` null), because an expiring key fails silently later |
+| Cloudflare | `/user/tokens/verify` → active; look up the zone (it may not exist yet) |
+| Twilio | the account answers with the API key; the number is voice-capable |
+| Claude | a 1-token request with `ANTHROPIC_API_KEY` (a fraction of a cent), or `CLAUDE_CODE_OAUTH_TOKEN` is set |
+| Tailscale | auth key set; this machine and the home machine are on the tailnet |
+| Namecheap (optional) | the API answers and this machine's IP is whitelisted |
+| Domain | registered to you; which registrar (Namecheap → API, others → a manual step) |
+| Home machine | key-based SSH works, Docker runs, it's on the tailnet |
+| Cost | prints the estimate (see [Costs](/costs/)) |
+
+**Needs you:** filling in part 1 of `anvil.env`. **Verifies:** every required line green.
+
+## 10-secrets: generate everything nobody should type
+
+1. `scripts/anvil-secrets init`: age key (if missing) and `.sops.yaml`; every generated value in `anvil.env`
+   (`STATUS_CODE`, `WEBHOOK_TOKEN`, `ALERT_SERVICE_PASSWORD`, `GRAFANA_ADMIN_PASSWORD`, `ATLAS_*`,
+   `HEALTH_DB_PASSWORD`, each project's `<NS>_RW/RO_PASSWORD`); each app's `generate:` keys from `sites.yaml` into
+   `apps/<ns>/prod.env`; then encrypts. It never changes a value that is already set.
+2. **Stops and asks you** to copy `~/.config/sops/age/keys.txt` into your password manager and confirm.
+3. `scripts/origin-pull-ca`: your own CA and the client certificate Cloudflare will present.
+4. `make ssh-key`: `~/.ssh/id_ed25519_anvil`, the only key the server accepts.
+5. `make hooks`, `make secrets-encrypt`, `scripts/secrets.sh check`.
+
+**Needs you:** saving the age key. **Verifies:** `secrets.sh check` passes; `git status` shows only `.sops` twins;
+`anvil-secrets missing` prints nothing.
+
+## 20-cloudflare: the zone, nameservers, certificates
+
+1. `python3 -I scripts/cloudflare-zones.py`: creates the zone, mirrors the existing records listed in `sites.yaml`
+   (DNS-only), sets SSL **Full (strict)**, uploads your origin-pull client certificate and turns Authenticated Origin
+   Pulls on. Idempotent. The zone id goes into `anvil.env` (`ANVIL_CF_ZONE_ID`).
+2. **Nameservers**: reads the pair Cloudflare assigned **to this zone** (they differ per zone). With Namecheap
+   credentials it sets them by API (showing you the call first; the permission check may block DNS changes); otherwise
+   it writes a `HUMAN.md` task with the exact two names and waits.
+3. Waits for `status: active`, then for a certificate pack `active` (before that every HTTPS request through Cloudflare
+   fails), and checks Google Public DNS sees Cloudflare's pair (if not, you flush it).
+4. `python3 -I scripts/origin-certs.py`: one Origin CA certificate per zone (zone + `*.zone`, 15 years) in
+   `.data/origin-ca/`, then `make secrets-encrypt`.
+
+**Needs you:** the nameserver switch without a Namecheap token; a Google DNS flush if it's stale. **Verifies:** zone
+active, edge certificate active, the Origin CA certificate exists, Authenticated Origin Pulls on.
+
+## 30-infra: the server
+
+1. `make init`, `make plan`, and **you read the plan together**: the image-import chain (bucket, qcow2, snapshot,
+   image), the private network, the security group (80/443 from Cloudflare's ranges, the SSH port), the flexible IP,
+   the instance. Nothing else.
+2. `make apply` (uploads ~600 MB; re-run if it fails half-way).
+3. Records `ANVIL_SERVER_IP`; waits for SSH (up to 10 min) and `kubectl get nodes` → `Ready`.
+4. Records the server's tailnet name and IP.
+5. `make cleanup` (deletes the import leftovers) and `make secrets-encrypt` (the Terraform state holds the k3s token).
+
+**Needs you:** reading the plan. **Verifies:** a plain request to the server's IP **fails** (only Cloudflare may
+connect), SSH answers on `ANVIL_SSH_PORT`, port 22 is closed, the node is Ready. It never runs `terraform destroy`.
+
+## 40-platform: the shared stack
+
+1. A private container-registry namespace `<name>-<6 hex>` → `ANVIL_REGISTRY`.
+2. The backup bucket `<name>-backups-<6 hex>` with lifecycle rules (`daily/` 30 days, `monthly/` 365 days), and an IAM
+   application with **object write + email send only**, key without expiry. The domain is verified in Scaleway
+   Transactional Email so failure emails arrive.
+3. `make images` (commit first: dirty builds are refused): `anvil-backup`, `twilio-alert` (multi-arch), `anvil-demo`;
+   tags land in `anvil.env`.
+4. `make apps` (`make-secrets.py`, then `node.sh deploy-all`: origin-ca, atlas, webhook, alerting, www, dozzle, then
+   the apps) and `scripts/node.sh atlas-users`.
+5. Checks `tailscale serve` publishes :8443, :9443, :3443 and :443 on the node.
+6. Runs the backup once (`kubectl -n atlas create job --from=cronjob/atlas-backup zz-first-backup`), reads its log,
+   deletes the job.
+
+**Verifies:** every pod Running/Ready, `sites.py check` 0 errors, Grafana opens on the tailnet.
+
+## 50-demo-app: something to show
+
+1. `scripts/node.sh deploy anvil-demo` (its Secrets come from make-secrets, its database users from atlas-users).
+2. Before DNS, through Traefik on the box with the origin-pull certificate: `node.sh curl demo.<domain> /` and
+   `/readyz` → 200.
+3. Cutover (only after the edge certificate is active): `cutover.py` for the demo's hosts and `status.<domain>`.
+4. Checks from outside **through a Cloudflare IP** (`curl --resolve`), then the real URLs, including
+   `/overall?code=…`.
+5. One guestbook entry in a browser; the worker approves it within seconds.
+
+**Verifies:** `/cluster?code=…` is 200.
+
+## 60-alerts: being told when it breaks
+
+1. **Asks you first**, then places one test call through twilio-alert (the password passed on stdin, never on a
+   logged command line). You confirm the phone rang.
+2. Writes the watchdog's `.env` on the home machine (mode 600, never committed) and starts it with
+   `scripts/home-deploy watchdog <image>`.
+3. Checks the watchdog's log shows `/watchdog` → ok every minute, and explains how calls behave (answer = 60-minute
+   pause, voicemail doesn't count, quiet hours wait, a silence also mutes the home watchdog).
+
+**Needs you:** consent and picking up. **Verifies:** `Watchdog` firing in Alertmanager (firing = healthy),
+`/watchdog?code=…` → `ok:true`.
+
+## 70-autopilot: Claude fixes what it safely can
+
+1. **The vault** on the home machine (OpenBao, separate from any other): `scripts/home-deploy openbao`, static seal
+   key, your login, the AppRole `claude` with the read-only `claude-ops` policy. Under `secret/ops/` only
+   operator/troubleshooting credentials (SSH key, status code, webhook token, the backup key for email, the age key
+   for read-only decrypts, the off-site snapshot key). **Never the apps' secrets.**
+2. **The image** from the autopilot repo (`./build.sh`, multi-arch) → `ANVIL_AUTOPILOT_TAG`; a **read-only** deploy key
+   on GitHub (it clones, it can never push).
+3. `~/<name>-autopilot/secrets.env` on the home machine (Claude credential, AppRole id/secret), then
+   `scripts/home-deploy autopilot <image>` (renders `autopilot.yaml` too).
+4. `/autopilot?code=…` shows IDLE with a heartbeat under a minute old.
+5. **Live tests** (after telling you; a failed fix phones you after 5 minutes):
+   - a bad release: `kubectl -n anvil-demo set env deploy/anvil-demo-web BREAK_ON_START=1` (a crash loop). Expected:
+     an alert, a run, `rollout undo`, FIXED, the session in `/autopilot_runs`.
+   - an unfixable case: in `zz-unfixable`, a Deployment whose `envFrom` names a Secret that doesn't exist. The
+     autopilot must **give up** (it can't create secrets), the calls go on, the reset link re-arms it.
+   Then every `zz-` thing is deleted.
+
+**Needs you:** consent to the live test. **Verifies:** both tests behaved; the guard refused anything outside
+restart / undo / re-run job / delete one pod.
+
+## 80-verify: everything green, proven
+
+Changes nothing except a throwaway restore. Reports check · result · evidence:
+
+1. `/overall?code=…` → 200 and `&strict=1` → 200.
+2. `make check` (sites vs manifests, secret twins current, no tracked plaintext).
+3. `scripts/node.sh diff <ns>` empty for every namespace: the cluster runs exactly the repo.
+4. Firewall from outside: HTTPS to the IP fails, port 22 fails, the SSH port answers.
+5. Today's backup exists in the bucket (listed with an **admin** key from your laptop) and `/backups` → 200.
+6. **Restore test**: the newest `anvil_demo` dump into a throwaway database `zz_restore_test`, count rows, drop it.
+7. Alertmanager holds only `Watchdog`; twilio-alert's `/pager` shows `"problems":[]`.
+8. The autopilot is IDLE with a fresh heartbeat.
+9. A report in `docs/verify-<date>.md` (no secrets).
+
+Use it any time to audit a running platform.
+
+## 99-teardown: delete everything, leave nothing billable
+
+Only when you ask. It **asks you to confirm by the platform's name** (`ANVIL_NAME`) before any delete.
+
+1. Deletes the DNS records `cutover.py` created; asks whether to delete the zone too.
+2. `make destroy`, after reading the plan (only this platform's resources).
+3. The backup and vault-snapshot buckets: **asks**, because they hold the only off-site copies; deletes them with an
+   admin key (the server's key can't, by design).
+4. The registry namespace, the backup IAM application and its key.
+5. `docker compose down` for the watchdog, autopilot and vault on the home machine (asks before deleting data).
+6. Removes the server from the tailnet.
+7. **Verifies:** no instance, IP, volume, snapshot, image, bucket or registry namespace named `<name>*` is left; prints
+   the remaining hourly cost (€0).
+
+Keep `anvil.env.sops` and the git repo: with them the platform can be rebuilt.
+
+<Aside type="note" title="Not a bootstrap step: update-images">
+`.claude/skills/update-images` updates every app's packages, rebuilds and pushes images (one subagent per repo,
+never deploying) and stops for your approval before anything is released. See
+[Image tags](/reference/image-tags/#updating-every-app).
+</Aside>

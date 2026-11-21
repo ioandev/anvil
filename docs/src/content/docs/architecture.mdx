@@ -1,0 +1,87 @@
+---
+title: Architecture
+description: The whole system on one page, then the four paths through it - requests, backups, alerts and the autopilot.
+---
+
+import RequestPath from '../../components/RequestPath.astro'
+import BackupPath from '../../components/BackupPath.astro'
+import AlertPath from '../../components/AlertPath.astro'
+import AutopilotLoop from '../../components/AutopilotLoop.astro'
+
+## The pieces
+
+| Where | What runs there |
+|---|---|
+| **Cloudflare** (Free plan) | DNS for every zone, proxied records, edge certificates, Authenticated Origin Pulls with your client certificate, optional HTML cache |
+| **The server** (one Scaleway instance) | Flatcar Container Linux; k3s (single node) with Traefik and ServiceLB; Tailscale (system extension) |
+| … namespace `kube-system` | Traefik, the default TLSStore (Origin CA certs) and the default TLSOption (requires your client cert) |
+| … `platform/*` namespaces | `atlas` (shared MariaDB + backup CronJobs), `alerting` (Prometheus, Alertmanager, blackbox, kube-state-metrics, Grafana, twilio-alert), `webhook` (status endpoints, health-watch), `www` (redirects), `origin-ca`, `dozzle` (log viewer) |
+| … `apps/*` namespaces | one per project; Services named `<project>-<component>` |
+| **Object Storage** (Scaleway) | the private backup bucket; the container registry |
+| **Your tailnet** | the only way to reach Grafana, Prometheus, Alertmanager and Dozzle |
+| **A second machine** (a Mac mini on the original server) | the watchdog, the autopilot, a vault for operator credentials, the daily backup pull |
+| **Your laptop** | the repo, Terraform, the age key, Claude Code; the Cloudflare token never leaves it |
+
+Nothing on the server connects out to the second machine: the second machine polls and posts. Nothing on the
+second machine is reachable from the internet.
+
+## Request path
+
+<RequestPath />
+
+1. The visitor's browser talks TLS to **Cloudflare's edge**, with Cloudflare's own certificate.
+2. Cloudflare opens a new TLS connection to the origin IP and presents a **client certificate signed by your CA**
+   (Authenticated Origin Pulls, uploaded per zone by `scripts/cloudflare-zones.py`).
+3. The Scaleway **security group** only admits 80/443 from Cloudflare's published IPv4 ranges (plus SSH on a
+   custom port). There is no IPv6 on the box.
+4. **Traefik** refuses any handshake without a client certificate from your CA (a `TLSOption` named `default`,
+   `RequireAndVerifyClientCert`), so another Cloudflare customer pointing their zone at your IP gets nowhere. It
+   answers with the zone's **Cloudflare Origin CA** certificate (valid 15 years, issued from your laptop; no ACME).
+5. The app's Service and pod. Apps see `X-Forwarded-For: <visitor>, 10.42.x.x` and must trust **two** hops, or
+   better, read `CF-Connecting-IP` ([rule 7](/reference/app-rules/#7-client-ip)).
+
+Details: [Edge (Cloudflare)](/components/edge/).
+
+## Backup path
+
+<BackupPath />
+
+Every night a CronJob dumps each database (as a read-only user; apps with SQLite files can add a job using SQLite's
+online `.backup`) and uploads them with **signed PUTs**: the key may write objects and nothing else, so even a fully compromised
+server can't delete or read its own backups. Bucket lifecycle rules expire `daily/` after 30 days and `monthly/`
+after 365. A morning job checks that every backup CronJob (found by its `component: backup` label) succeeded in the last 26 hours, which also catches jobs
+that never started (and so could not report their own failure). Details: [Data & backups](/components/data/).
+
+## Alert path
+
+<AlertPath />
+
+- **Inside the server:** blackbox probes hit every site through Cloudflare every 30 s (like a visitor would),
+  kube-state-metrics reports every workload, and Prometheus also probes the status webhook's `/overall`. Rules fire
+  to Alertmanager, Alertmanager to **twilio-alert**, twilio-alert to Twilio, Twilio to your phone.
+- **Outside the server:** an always-firing `Watchdog` alert reaches the webhook's `/am_heartbeat`. The second
+  machine pulls `/watchdog` every minute and places its **own** call if the server is unreachable for 10 minutes or
+  the heartbeat is older than 2 hours (alerting itself is dead).
+
+Details: [Monitoring & phone alerts](/components/monitoring/) and [Status webhooks](/components/status-webhooks/).
+
+## Autopilot loop
+
+<AutopilotLoop />
+
+The autopilot runs on the second machine. When an alert stays on for two polls (30 s), it logs in to the vault,
+puts its credentials in tmpfs, clones the repo read-only for context, and runs Claude Code headless with a prompt
+that includes the incident, `/overall`, `/cluster`, two weeks of post-mortems and the site's rules. A **PreToolUse
+guard** lets through read-only commands and a short list of live-only writes. "Fixed" means two clean polls **and**
+the strict status check passing; anything else latches `gave_up` so a stuck incident can't burn runs. While it
+works, phone calls are held for at most 20 minutes, once per incident. Details: [Autopilot](/components/autopilot/).
+
+## What happens at boot
+
+| Layer | How it comes back |
+|---|---|
+| Node | Ignition ran once at first boot; Flatcar boots the same image every time (OS auto-updates are masked) |
+| k3s | enabled at boot, `Restart=always`, `StartLimitIntervalSec=0` (drop-in `k3s.service.d/20-restart-forever.conf`), so systemd never gives up |
+| Workloads | Deployments and StatefulSets only (never bare pods), `restartPolicy: Always`; liveness probes restart hung apps |
+| Tailscale | system extension; `tailscale serve` re-publishes the internal UIs at boot |
+| Second machine | containers with `restart: unless-stopped`; the vault unseals itself (see the FileVault caveat in [Mac helpers](/components/mac-helpers/)) |

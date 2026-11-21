@@ -1,0 +1,318 @@
+# webhook: webhookd (github.com/ncarlier/webhookd) at https://status.${ANVIL_DOMAIN}, running the scripts
+# in platform/webhook/hooks/ (ConfigMap webhook-hooks, built by scripts/node.sh deploy webhook).
+#   GET/POST /error_arduino  latched error state (lock in the webhook-locks PVC; clear it with
+#                            platform/webhook/clear-error-arduino.sh). POST needs header X-Token (prod.env
+#                            WEBHOOK_TOKEN); GET is public but only says how many errors, X-Token lists them.
+#                            health-watch (below) and the nightly backups post here.
+#   GET /memory              (public, no code) 200 if the node has >= 500 MB of memory available, else 500
+#   POST /am_latch?token=…    Alertmanager's severity=notify alerts -> the error latch, one line per alert and site a day
+#   GET /space               200 if the node's disk has >= 10 GB free, else 500
+#   GET /backups             200/500 status of the nightly backups (every CronJob labelled component=backup), as last reported by
+#                            health-watch (500 too when its report is over 45 minutes old)
+# Not migrated: deploy / release / tracking. They only operated on server-2's
+# host files (mfrontend version files, backup-cron markers) and /opt/secrets.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webhook
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: webhook-locks
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources: { requests: { storage: 100Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  selector: { app: webhook }
+  ports: [{ port: 9000 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook
+  labels: { app.kubernetes.io/name: webhook, app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: server }
+  namespace: webhook
+spec:
+  selector: { matchLabels: { app: webhook } }
+  # RWO lock volume: one pod at a time.
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: webhook, app.kubernetes.io/name: webhook, app.kubernetes.io/part-of: webhook, app.kubernetes.io/component: server } }
+    spec:
+      enableServiceLinks: false
+      # The pause process (PID 1) reaps hook processes webhookd leaves behind; without it webhookd collected
+      # thousands of zombies on the original server (2,363 to 9,565) and the autopilot restarted it three times.
+      shareProcessNamespace: true
+      securityContext: { runAsUser: 5050, runAsGroup: 5050, fsGroup: 5050 }
+      imagePullSecrets: [{ name: anvil-registry }]   # our own webhookd image (the node's registry login can't read it)
+      containers:
+        - name: webhookd
+          image: "${ANVIL_REGISTRY}/webhookd:${ANVIL_WEBHOOKD_TAG}"   # images/webhookd: upstream + redacted request log
+          env:
+            - { name: WHD_HOOK_SCRIPTS, value: /scripts }
+            # webhookd 1.22 passes only these request headers to the hooks (as lowercase env vars); the hooks check
+            # X-Token on every POST, so without it every report and post was refused (found by the first real install).
+            - { name: WHD_ALLOWED_UPSTREAM_HEADERS, value: "accept,content-type,content-length,user-agent,x-forwarded-for,x-token" }
+            # The public base URL the hooks print in links, and the platform's name in messages
+            - { name: PUBLIC_URL, value: "https://status.${ANVIL_DOMAIN}" }
+            - { name: PLATFORM_NAME, value: "${ANVIL_NAME}" }
+            - { name: WHD_HOOK_DEFAULT_EXT, value: sh }
+            # info, and only the http module: "debug" logged each request's args (incl. ?code=) and "hook" logged every
+            # output line (post-mortems, transcripts) into the pod log, which Dozzle shows the whole tailnet.
+            - { name: WHD_LOG_LEVEL, value: info }
+            - { name: WHD_LISTEN_ADDR, value: ":9000" }
+            - { name: WHD_LOG_MODULES, value: "http" }
+            - { name: WHD_HOOK_DEFAULT_MODE, value: buffered }
+            # Posting to /error_arduino (and reading its details) needs header X-Token with this.
+            - { name: WEBHOOK_TOKEN, valueFrom: { secretKeyRef: { name: webhook-auth, key: WEBHOOK_TOKEN } } }
+            # GET ?code=<this> is needed to see any status; without it every endpoint is a bare 500.
+            - { name: STATUS_CODE, valueFrom: { secretKeyRef: { name: webhook-auth, key: STATUS_CODE } } }
+            # autopilot_state.sh tells twilio-alert (in-cluster) when the autopilot is working on an incident
+            - { name: ALERT_SERVICE_PASSWORD, valueFrom: { secretKeyRef: { name: webhook-auth, key: ALERT_SERVICE_PASSWORD } } }
+          ports: [{ containerPort: 9000 }]
+          readinessProbe: { tcpSocket: { port: 9000 }, periodSeconds: 30 }
+          # Restarts it if it stops answering (hung, not just crashed). Generous, so slow starts aren't killed.
+          livenessProbe: { tcpSocket: { port: 9000 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          volumeMounts:
+            - { name: hooks, mountPath: /scripts, readOnly: true }
+            - { name: locks, mountPath: /locks }
+      volumes:
+        - { name: hooks, configMap: { name: webhook-hooks, defaultMode: 0755 } }
+        - { name: locks, persistentVolumeClaim: { claimName: webhook-locks } }
+---
+# webhookd picks the response Content-Type from the request's Accept header: a browser asks for text/html and gets
+# the plain-text status pages labelled as HTML (one long paragraph). This makes every request ask for text/plain.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: webhook-plain-text
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  headers:
+    customRequestHeaders:
+      Accept: text/plain
+---
+# Per-visitor rate limit on everything at status.${ANVIL_DOMAIN} (GETs with ?code=, POSTs with X-Token), so nobody can hammer the
+# code/token checks or the hooks behind them (some run kubectl or database queries). Keyed on CF-Connecting-IP, the
+# visitor's real address (rule 7; X-Forwarded-For's first entry is forgeable). Over the limit: 429.
+# Normal load per IP: the Mac (watchdog 1/min + autopilot heartbeat 4/min + transcript uploads in bursts of up to a
+# few dozen 60 kB chunks + the owner's browser); Prometheus' /overall probe comes from the server's own IP, 2/min.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: webhook-ratelimit
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  rateLimit:
+    period: 1m
+    average: 60
+    burst: 100
+    sourceCriterion: { requestHeaderName: CF-Connecting-IP }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webhook
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: webhook-webhook-ratelimit@kubernetescrd,webhook-webhook-plain-text@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: status.${ANVIL_DOMAIN}
+      http:
+        paths:
+          # The autopilot's session transcripts, as files (webhookd can only return the last 100 lines of output)
+          - { path: /autopilot-files, pathType: Prefix, backend: { service: { name: webhook-files, port: { number: 8080 } } } }
+          - { path: /, pathType: Prefix, backend: { service: { name: webhook, port: { number: 9000 } } } }
+  tls:
+    - hosts: ["status.${ANVIL_DOMAIN}"]
+---
+# webhook-files: serves the autopilot's scrubbed session transcripts (uploaded by the Mac through POST /autopilot_run
+# into the webhook-locks PVC) read-only at https://status.${ANVIL_DOMAIN}/autopilot-files/<STATUS_CODE>/<run id>.md. The code is
+# part of the path (a symlink named after it), so without it there is nothing to find; no directory listings, no
+# access log. GET /autopilot_runs?code=... lists the runs with these links. busybox httpd, ~1 MB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: webhook-files-httpd
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+data:
+  httpd.conf: |
+    .md:text/plain; charset=utf-8
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-files
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  selector: { app: webhook-files }
+  ports: [{ port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-files
+  labels: { app.kubernetes.io/name: webhook-files, app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: web }
+  namespace: webhook
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: webhook-files } }
+  template:
+    metadata: { labels: { app: webhook-files, app.kubernetes.io/name: webhook-files, app.kubernetes.io/part-of: webhook, app.kubernetes.io/component: web } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5052, runAsGroup: 5052 }
+      containers:
+        - name: httpd
+          image: docker.io/library/busybox:1.37
+          command: [sh, -c]
+          args:
+            - 'mkdir -p /srv/autopilot-files && ln -sfn /locks/autopilot/runs "/srv/autopilot-files/$CODE" && exec httpd -f -p 8080 -h /srv -c /etc/httpd/httpd.conf'
+          env:
+            - { name: CODE, valueFrom: { secretKeyRef: { name: webhook-auth, key: STATUS_CODE } } }
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 15 }
+          livenessProbe: { tcpSocket: { port: 8080 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 5m, memory: 8Mi }, limits: { memory: 32Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: locks, mountPath: /locks, readOnly: true }
+            - { name: srv, mountPath: /srv }
+            - { name: conf, mountPath: /etc/httpd }
+      volumes:
+        - { name: locks, persistentVolumeClaim: { claimName: webhook-locks, readOnly: true } }
+        - { name: srv, emptyDir: { sizeLimit: 1Mi } }
+        - { name: conf, configMap: { name: webhook-files-httpd } }
+---
+# health-watch: every 15 minutes, posts a short line to /error_arduino for anything erroring on ${ANVIL_NAME} (pods that
+# can't start or keep crashing, failed Jobs). Script: platform/backup/health-watch.sh.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: health-watch
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+---
+# Cluster-wide, read-only, and only pods, jobs and cronjobs (no secrets, no logs, no exec).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: health-watch
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+rules:
+  - { apiGroups: [""], resources: [pods, nodes], verbs: [list] }   # nodes: the daily pool-node reminder
+  - { apiGroups: [batch], resources: [jobs, cronjobs], verbs: [list] }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: health-watch
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: health-watch }
+subjects: [{ kind: ServiceAccount, name: health-watch, namespace: webhook }]
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: health-watch
+  labels: { app.kubernetes.io/name: health-watch, app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: monitoring }
+  namespace: webhook
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          enableServiceLinks: false
+          restartPolicy: Never
+          serviceAccountName: health-watch
+          imagePullSecrets: [{ name: anvil-registry }]
+          securityContext: { runAsUser: 5051, runAsGroup: 5051 }
+          containers:
+            - name: watch
+              image: ${ANVIL_REGISTRY}/anvil-backup:${ANVIL_BACKUP_TAG}
+              command: ["/usr/local/bin/health-watch"]
+              envFrom: [{ secretRef: { name: health-watch } }]
+              resources: { requests: { cpu: 10m, memory: 32Mi }, limits: { memory: 128Mi } }
+              securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+---
+# autopilot-viewer: every autopilot run (result, alerts, the final report, each tool call with its output, Claude's
+# messages) as a web page, on the TAILNET ONLY: https://<tailnet host>:8446 (`tailscale serve --https=8446`
+# → the fixed ClusterIP below; in Butane). No Ingress, no public DNS. Reads the same webhook-locks PVC as
+# webhook-files, read-only: runs/<id>.md (the scrubbed transcripts the Mac uploads), state.json (live state).
+# The page and its CGI list come from platform/webhook/autopilot-viewer/ (ConfigMap autopilot-viewer, built by
+# sites.yaml configmaps, node.sh deploy webhook). busybox httpd, ~1 MB.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autopilot-viewer
+  labels: { app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+  namespace: webhook
+spec:
+  clusterIP: 10.43.200.97
+  selector: { app: autopilot-viewer }
+  ports: [{ port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autopilot-viewer
+  labels: { app.kubernetes.io/name: autopilot-viewer, app.kubernetes.io/part-of: webhook, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: web }
+  namespace: webhook
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: autopilot-viewer } }
+  template:
+    metadata: { labels: { app: autopilot-viewer, app.kubernetes.io/name: autopilot-viewer, app.kubernetes.io/part-of: webhook, app.kubernetes.io/component: web } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5053, runAsGroup: 5053 }
+      containers:
+        - name: httpd
+          image: docker.io/library/busybox:1.37
+          command: [sh, -c]
+          args:
+            - >-
+              mkdir -p /srv/cgi-bin && ln -sfn /app/index.html /srv/index.html && ln -sfn /app/runs.cgi /srv/cgi-bin/runs &&
+              ln -sfn /locks/autopilot/runs /srv/runs && ln -sfn /locks/autopilot/state.json /srv/state.json &&
+              printf '.md:text/plain; charset=utf-8\n.json:application/json; charset=utf-8\n' > /srv/.httpd.conf &&
+              exec httpd -f -p 8080 -h /srv -c /srv/.httpd.conf
+          ports: [{ containerPort: 8080 }]
+          readinessProbe: { httpGet: { path: /index.html, port: 8080 }, periodSeconds: 15 }
+          livenessProbe: { httpGet: { path: /index.html, port: 8080 }, initialDelaySeconds: 120, periodSeconds: 30, timeoutSeconds: 10, failureThreshold: 5 }
+          resources: { requests: { cpu: 5m, memory: 8Mi }, limits: { memory: 32Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts:
+            - { name: locks, mountPath: /locks, readOnly: true }
+            - { name: srv, mountPath: /srv }
+            - { name: app, mountPath: /app }
+      volumes:
+        - { name: locks, persistentVolumeClaim: { claimName: webhook-locks, readOnly: true } }
+        - { name: srv, emptyDir: { sizeLimit: 1Mi } }
+        - { name: app, configMap: { name: autopilot-viewer, defaultMode: 0555 } }

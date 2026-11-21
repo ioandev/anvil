@@ -1,0 +1,158 @@
+# edge-warmer: keeps Cloudflare's cache of every site with `edge_cache:` in sites.yaml warm (docs: Components → Edge).
+# It requests each warm URL (default: each cached host's home page) just before its edge TTL runs out, as an anonymous
+# visitor (no cookie, no Authorization), so the first real visitor after a quiet spell is answered from Cloudflare,
+# not the server. With Cloudflare's Tiered Cache (on for every cached zone) the edge locations elsewhere fetch from the
+# upper tier this keeps fresh, not from the server. One loop, a few MB of memory; one log line per 5 minutes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge-warmer
+  labels: { app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-warmer-urls
+  namespace: edge-warmer
+  labels: { app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+data:
+  # BEGIN generated from sites.yaml by scripts/sites.py render: edit sites.yaml, not this
+  urls.txt: |
+    30 https://demo.${ANVIL_DOMAIN}/
+  purge.txt: |
+    ${ANVIL_DOMAIN}|anvil_demo|anvil_demo_ro|SELECT COUNT(*), MAX(approved_at) FROM entries WHERE approved_at IS NOT NULL
+  # END generated
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-warmer-script
+  namespace: edge-warmer
+  labels: { app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+data:
+  warm.sh: |
+    #!/bin/sh
+    # urls.txt: "<ttl seconds> <url>" per line. Each URL is fetched again once 80% of its TTL has passed (at least
+    # every 8 s; checked every 5 s), so it rarely expires at Cloudflare while visitors might ask for it.
+    mkdir -p /tmp/next
+    n=0; hit=0; miss=0; err=0; last=$(date +%s)
+    while true; do
+      now=$(date +%s); due=""; i=0
+      while read -r ttl url; do
+        [ -n "$url" ] || continue
+        # The line number is the key and the shell's own read loads it: no process per URL per pass.
+        i=$((i+1)); f=/tmp/next/$i; next=0
+        [ -f "$f" ] && read -r next < "$f"
+        [ "$now" -ge "$next" ] || continue
+        gap=$((ttl * 8 / 10)); [ "$gap" -lt 8 ] && gap=8
+        echo $((now + gap)) > "$f"
+        due="$due $url"
+      done < /config/urls.txt
+      if [ -n "$due" ]; then
+        # One curl for everything due: it reuses its connections (one TLS handshake per site, not per request).
+        for s in $(curl -s -m 30 --compressed -A "anvil edge-warmer" -o /dev/null -w '%header{cf-cache-status}\n' $due); do
+          n=$((n+1)); case "$s" in HIT|REVALIDATED|UPDATING|STALE) hit=$((hit+1));; MISS|EXPIRED) miss=$((miss+1));; *) err=$((err+1));; esac
+        done
+      fi
+      if [ $((now - last)) -ge 300 ]; then
+        echo "$(date -u +%FT%TZ) last 5 min: $n requests, $hit already cached, $miss refreshed, $err other"
+        n=0; hit=0; miss=0; err=0; last=$now
+      fi
+      sleep 5
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-warmer
+  namespace: edge-warmer
+  labels: { app.kubernetes.io/name: edge-warmer, app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: job }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: edge-warmer } }
+  template:
+    metadata: { labels: { app: edge-warmer, app.kubernetes.io/name: edge-warmer, app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/component: job } }
+    spec:
+      enableServiceLinks: false
+      securityContext: { runAsNonRoot: true, runAsUser: 5540, runAsGroup: 5540 }
+      containers:
+        - name: warm
+          image: curlimages/curl:8.10.1
+          command: ["sh", "/script/warm.sh"]
+          resources: { requests: { cpu: 5m, memory: 8Mi }, limits: { memory: 32Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          volumeMounts:
+            - { name: urls, mountPath: /config }
+            - { name: script, mountPath: /script }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: urls, configMap: { name: edge-warmer-urls } }
+        - { name: script, configMap: { name: edge-warmer-script } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+---
+# edge-purger: purges a site's Cloudflare cache when its content changes in the database (`purge_on_change:` in
+# sites.yaml: a query whose answer changes when the content does, read as the site's read-only user), so long edge
+# TTLs never hide new content. Checks every 30 s. Needs CLOUDFLARE_PURGE_TOKEN in anvil.env (a SEPARATE token with only
+# Zone Read + Cache Purge on the zone: the main Cloudflare token never goes to the server); without it, it waits.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edge-purger-script
+  namespace: edge-warmer
+  labels: { app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform }
+data:
+  purge.sh: |
+    #!/bin/bash
+    # purge.txt: "zone|db|user|query" per line; passwords as DB_PW_<db> in the environment.
+    mkdir -p /tmp/state; warned=0
+    while true; do
+      if [ -z "${CLOUDFLARE_PURGE_TOKEN:-}" ]; then
+        [ $warned -eq 0 ] && echo "no CLOUDFLARE_PURGE_TOKEN (anvil.env): not purging"; warned=1; sleep 300; continue
+      fi
+      while IFS='|' read -r zone db user query; do
+        [ -n "$zone" ] || continue
+        pwvar="DB_PW_${db}"; pw="${!pwvar:-}"
+        sum=$(MYSQL_PWD="$pw" mariadb -h atlas-mariadb.atlas -u "$user" -N "$db" -e "$query" 2>/dev/null | md5sum | cut -c1-16)
+        [ -n "$sum" ] && [ "$sum" != "d41d8cd98f00b204" ] || { echo "$(date -u +%FT%TZ) $zone: the change check failed"; continue; }
+        f="/tmp/state/$zone"; old=$(cat "$f" 2>/dev/null || true); echo "$sum" > "$f"
+        [ -n "$old" ] && [ "$old" != "$sum" ] || continue
+        zid=$(curl -s -m 20 -H "Authorization: Bearer $CLOUDFLARE_PURGE_TOKEN" "https://api.cloudflare.com/client/v4/zones?name=$zone" | jq -r '.result[0].id // empty')
+        r=$(curl -s -m 20 -X POST -H "Authorization: Bearer $CLOUDFLARE_PURGE_TOKEN" -H "Content-Type: application/json" \
+            --data '{"purge_everything":true}' "https://api.cloudflare.com/client/v4/zones/$zid/purge_cache" | jq -r '.success')
+        echo "$(date -u +%FT%TZ) $zone: content changed, cache purge: $r"
+      done < /config/purge.txt
+      sleep 30
+    done
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-purger
+  namespace: edge-warmer
+  labels: { app.kubernetes.io/name: edge-purger, app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/managed-by: anvil, anvil/tier: platform, app.kubernetes.io/component: job }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: edge-purger } }
+  template:
+    metadata: { labels: { app: edge-purger, app.kubernetes.io/name: edge-purger, app.kubernetes.io/part-of: edge-warmer, app.kubernetes.io/component: job } }
+    spec:
+      enableServiceLinks: false
+      imagePullSecrets: [{ name: anvil-registry }]
+      securityContext: { runAsNonRoot: true, runAsUser: 5541, runAsGroup: 5541 }
+      containers:
+        - name: purge
+          image: ${ANVIL_REGISTRY}/anvil-backup:${ANVIL_BACKUP_TAG}   # mariadb client, curl, jq
+          command: ["bash", "/script/purge.sh"]
+          envFrom: [{ secretRef: { name: edge-purger } }]
+          resources: { requests: { cpu: 5m, memory: 8Mi }, limits: { memory: 48Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+          volumeMounts:
+            - { name: urls, mountPath: /config }
+            - { name: script, mountPath: /script }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - { name: urls, configMap: { name: edge-warmer-urls } }
+        - { name: script, configMap: { name: edge-purger-script } }
+        - { name: tmp, emptyDir: { medium: Memory, sizeLimit: 1Mi } }

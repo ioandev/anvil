@@ -1,0 +1,188 @@
+---
+title: Autopilot
+description: Claude Code in a container on the second machine - it watches the alerts, diagnoses and fixes incidents with live-only actions behind a guard hook, and writes a post-mortem.
+---
+
+import { Aside } from '@astrojs/starlight/components'
+import AutopilotLoop from '../../../components/AutopilotLoop.astro'
+
+The autopilot is an unattended on-call engineer: a container that polls Prometheus and Alertmanager every 15 s and,
+when an alert stays on, runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) headless to diagnose and
+(within strict limits) fix it, verifies the result and reports. It lives in its own MIT-licensed repo (`autopilot`)
+and is generic: the site describes itself in an `autopilot.yaml` in its own repo, and secrets come from the vault
+at run time.
+
+<AutopilotLoop />
+
+## What it may do: live-only actions
+
+The site repo is auto-committed and may hold the owner's unreleased edits, so the autopilot **never deploys or
+applies anything from it**. It only operates on what is live:
+
+| Allowed | Why it's safe |
+|---|---|
+| `kubectl rollout restart` | same spec, new pods |
+| `kubectl rollout undo [--to-revision=N]` | back to something that already ran |
+| `kubectl create job --from=cronjob/…` | re-run a job exactly as scheduled |
+| `kubectl delete pod <one name>` | its controller recreates it |
+| `crictl rmi --prune` on the node | unused images only (disk) |
+| `docker restart/start` of listed containers on the Mac | `mac_containers` in `autopilot.yaml` |
+| read-only `kubectl diff -f <manifest>` | to report unreleased changes |
+
+Refused: every other kubectl write (`apply`, `create -f`, `replace`, `patch`, `set`, `edit`, `scale`, `exec`, other
+deletes), deploy tools (`node.sh deploy`, `make apps`, helm), Terraform, destructive SQL, `curl | sh`, reboots,
+writing to `~/.ssh`, reading private keys, printing the environment, touching the secrets tmpfs or the vault,
+`git push`, plus the site's own `never` patterns. On the original server those add: no Terraform or make targets, no DNS or
+Cloudflare scripts, secrets may be decrypted for reading but never edited or regenerated, the shared MariaDB is
+read-only for it (report, don't restart), no root database access, no Tailscale changes.
+
+## How the rules are enforced
+
+- `claude -p` runs with `--permission-mode bypassPermissions` (nobody is there to approve prompts). What enforces
+  the rules instead is a **PreToolUse guard** (`bin/guard`), registered in `/etc/claude-code/managed-settings.json`
+  (managed settings can't be overridden; the file is root-owned in a read-only image) and again with `--settings`.
+- The repo's own `.claude/` settings are not loaded (`--setting-sources user`), nor any MCP servers
+  (`--strict-mcp-config`). The session gets only the tools the site lists (the original server: `Bash`, `Read`, `Skill`,
+  `WebSearch`).
+- The guard looks inside `ssh host '…'`, `bash -c '…'` and `$(…)`. Unknown or unparsable input is **refused**
+  (fail closed).
+- Skills shipped in the image: `triage`, `restart`, `rollback`, `free-disk`, `rerun-job`, `mac-services`, `report`.
+
+<Aside type="caution" title="A guardrail, not a sandbox">
+Pattern checks stop mistakes and casual prompt injection. A determined attacker who controls Claude's commands (for
+example through text planted in logs) could obfuscate a command past them, read the AppRole file with a script, or
+use its access directly. So anvil doesn't rely on the guard alone: the autopilot has **no SSH and no root**. It
+logs in as its own Kubernetes ServiceAccount (`platform/autopilot-access`), which may read everything except Secrets
+(no exec) and make only its repairs, and a ValidatingAdmissionPolicy refuses any change that would give a workload a
+Secret, a host path, a security setting, another service account or host access (rollbacks still pass). It holds no
+age key, so it can't decrypt anything, and it reaches the home machine's Docker only through an allow-list proxy
+(status reads, start, restart). What remains open: a Job it creates from a CronJob could use a Secret that CronJob's
+namespace already uses. See [Security](/security/#open-items).
+</Aside>
+
+## Safety model
+
+| Limit | Value |
+|---|---|
+| Start | 2 bad polls in a row (30 s), alerts that are not silenced; `Watchdog` and the severities in `AUTOPILOT_IGNORE_SEVERITIES` (`none`, `warning`, `notify`) ignored; an alert that hasn't fired yet must have been pending for `AUTOPILOT_PENDING_MIN_SECONDS` (2 min) first, a firing one counts at once |
+| Pre-run stale check | if the strict status check is already green, the run is skipped (don't spend a run on stale alerts) |
+| Run | one at a time, **15 min** hard limit (whole process group killed), then a report phase ≤ 5 min |
+| "Fixed" | two clean polls right after the run **and** the strict check (`/cluster?strict=1`, no work-in-progress exceptions) passing twice |
+| Latch | anything else is `gave_up`, latched: no new run until 60 min cooldown, 2 min of healthy polls, or your `reset` |
+| Daily cap | `AUTOPILOT_MAX_RUNS_PER_DAY` runs per UTC day (**15** in anvil's compose file); then only `reset` (or the next day) re-arms |
+| Pause | you can pause it 10–120 min (`/autopilot_pause`, `/autopilot_resume` to end it early); every `node.sh deploy` pauses it 10 min; calls are **not** paused by that |
+| Calls | held ≤ 20 min while it runs, once per incident; the next call reads its summary |
+| Failed poll | neutral (neither good nor bad): if monitoring is unreachable it does nothing (the watchdog covers that) |
+
+State lives in `/state/state.json`, so a restart keeps it; a run interrupted by a restart is reported as `error`.
+
+## Settings
+
+The container's own settings are environment in `mac/autopilot/docker-compose.yml`:
+
+| Setting | anvil's value | Meaning |
+|---|---|---|
+| `AUTOPILOT_MAX_RUNS_PER_DAY` | `15` | runs per UTC day before it stays given up until `reset` or the next day |
+| `AUTOPILOT_IGNORE_SEVERITIES` | `none,warning,notify` | alerts with these severities never start a run: `warning` goes nowhere and `notify` goes to the error latch, so neither would phone you either |
+| `AUTOPILOT_PENDING_MIN_SECONDS` | `120` | an alert that is still pending (not fired yet) must have been pending this long; firing alerts count at once |
+
+**Deploys pause it.** `scripts/node.sh deploy` pauses the autopilot for 10 minutes before it applies anything
+(best effort, through `/autopilot_pause?minutes=10`), so the autopilot doesn't investigate your own rollout. Phone
+alerts stay on: a deploy that really breaks something still calls you. `NO_AUTOPILOT_PAUSE=1` skips the pause;
+`/autopilot_resume?code=…` ends it at once. After a deploy, check its state (`/autopilot`, or Grafana) and resume it
+if you're done.
+
+## The run viewer
+
+Every run can be read in full on the tailnet at **`https://<node>.<tailnet>.ts.net:8446`**: the Deployment
+`webhook/autopilot-viewer` (UID 5053, busybox httpd, about 1 MB; page and CGI in `platform/webhook/autopilot-viewer/`),
+published by the node's `tailscale serve --https=8446` to a fixed ClusterIP (`10.43.200.97`, set in Butane). No
+Ingress, no public DNS. It reads the webhook's volume **read-only**: the scrubbed transcripts the home machine uploads
+after each run and the autopilot's live state.
+
+It shows:
+
+- the live state ("Watching", "Working on an incident", "Gave up: needs you", "Paused" with "resumes by itself in N
+  min", and "Mac not reporting" when its heartbeat is over 10 minutes old);
+- totals (runs, repaired, cleared by themselves, gave up, errors and timeouts, the median run time, Claude's usage
+  and cost, the number of tool calls) and runs per day;
+- every run with its alerts, its outcome, the final report (summary, cause, actions, next time), each tool call with
+  its command and output, and Claude's messages and thinking; filters by outcome.
+
+Everything in a transcript is untrusted text (logs, pages, alert text), so the page always escapes it and never
+interprets it as HTML.
+
+**"Repaired" is not the same as "fixed".** The autopilot records a run as `fixed` when the alerts were quiet
+afterwards, but that is often because they cleared by themselves. The viewer tells the two apart from the report's
+`actions`: **repaired** = fixed *and* it changed something; **cleared by itself** = fixed with no action. On the
+original server, of the first 52 runs only 5 were repaired, while 40 had changed nothing. The email subject says the
+same (`CLEARED BY ITSELF, no action taken`, `FIXED by the autopilot`, `NOT RESOLVED (…), needs you`).
+
+**Grafana's overview starts with the autopilot**: its state, paused and when it resumes, the home machine's last
+heartbeat, runs today, the last run, a state timeline, and links to the viewer and the status pages.
+
+## Fewer runs, not a quieter autopilot
+
+On the original server the autopilot once ran about 15 times a day, mostly on blips that cleared by themselves: of 51
+runs over eleven days, it changed something in 3. The fix was to remove the causes, not to silence the autopilot:
+
+| Cause | What changed |
+|---|---|
+| One failed probe turned `/cluster` (and so `/overall` and `ServerHealthRed`) red for 5 minutes | a site counts as down there only when **more than half** of its last 5 minutes of probes failed |
+| Runs started on alerts that had only been pending for seconds, while the rules themselves wait 5 minutes before phoning | `AUTOPILOT_PENDING_MIN_SECONDS=120`: a pending alert must be 2 minutes old; real outages still get a run before the first call |
+| `warning` alerts, which never phone anyone, started runs (all 15 runs of one day were one recorder's harmless failover warning) | `AUTOPILOT_IGNORE_SEVERITIES` (anvil adds `notify`) |
+| webhookd never reaped the hook scripts it started: up to 9,565 zombie processes, about 100 MB of kernel memory | `shareProcessNamespace: true` on the webhook pod: the pause process is PID 1 and reaps them |
+| Its own deploys looked like incidents | deploys pause it 10 minutes |
+
+The rest were a shared-CPU host losing 16–30% of its time to other customers and thin memory headroom: real, but not
+something an autopilot can fix. The [capacity alerts](/components/monitoring/#capacity-alerts-that-come-before-failures)
+now report those on the error latch instead.
+
+## Secrets at run time
+
+The container holds an AppRole file only. Per run it logs in to the vault, writes the Claude credential, the
+read-only deploy key and its kubeconfig into a **tmpfs** (`/run/autopilot`, mode 700),
+and deletes them after the report. The Claude credential is only in the Claude process's environment. The repo is
+cloned with a **read-only deploy key** (GitHub enforces read-only on every plan; a write key could push to `main`
+on a private personal repo).
+
+## Records
+
+| Record | Where | Contents |
+|---|---|---|
+| `transcript.jsonl` | the Mac, `~/<name>-autopilot-runs/<ts>/` | everything (raw): protect this folder |
+| `transcript.md`, `transcript.redacted.md` | same | readable; scrubbed (vault values + gitleaks findings → `[REDACTED]`) |
+| `transcript.jsonl.age` | off-site bucket (write-only key) | the raw transcript, age-encrypted |
+| post-mortem | `POST /postmortem` → `/changelog` | cause, what was done, unreleased repo changes noticed, next time, links |
+| email | Scaleway TEM API | the post-mortem, scrubbed |
+| browser copy | `/autopilot_runs?id=<ts>` | scrubbed session, 90 days |
+
+## Real test runs (on the original server, October 2026)
+
+| Test | Result |
+|---|---|
+| A throwaway Deployment switched to a non-existent image tag (ImagePullBackOff) | **fixed**: `rollout undo` to the previous revision; status green |
+| A throwaway Deployment referencing a Secret that never existed (CreateContainerConfigError), revision 1 only | **gave_up**, correctly: nothing to roll back to, a restart can't help; it told the owner what to do |
+| The same incident after the owner deleted the namespace | **fixed** with no action; it noted that the workload no longer existed. This led to the pre-run stale check. |
+
+The first run also found a bug in the autopilot itself (a helper in a `noexec` home folder) and worked around it
+with the equivalent allowed command, reporting it under "Next time".
+
+## Choosing the model and credential
+
+- The original server uses **Claude Opus 5.5, effort high**, for runs: they are rare and high-stakes. Commit messages and
+  other small jobs can use a cheaper model.
+- Credential: a subscription token (`claude setup-token`, valid about a year; renew before it expires) or an
+  **API key with a spend limit** (anvil's default for colleagues, so nobody needs a subscription).
+- Cost per run: roughly a few cents to ~$1–3 with Opus (an estimate, not a measurement); see [Costs](/costs/#autopilot-cost-per-run).
+
+## Configure it
+
+`autopilot.yaml` in the site repo root (all keys optional): `endpoints` (Alertmanager, Prometheus, webhook),
+`status_paths` (incl. `strict_check`), `secrets` (vault references, `redact_prefix`), `ssh` (alias, key file),
+`kubectl.remote` (e.g. `sudo /opt/bin/kubectl` over SSH), `run_env`, `never` (regex + reason), `never_paths`
+(files Claude may not edit in its clone), `mac_containers`, `age_recipient`, `offsite`, `email`, `claude`
+(`max_turns`, `model`, `effort`, `tools`) and free-text `notes` for Claude (what's critical, what's safe). The
+container itself is configured by environment (`ALERTMANAGER_URL`, `PROMETHEUS_URL`, `WEBHOOK_URL`, `REPO_URL`,
+`APPROLE_FILE`, timeouts) and runs `read_only`, `cap_drop: [ALL]`, `no-new-privileges`, as a non-root user, with
+tmpfs for secrets, clones and its home.

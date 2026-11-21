@@ -1,0 +1,50 @@
+---
+title: 'Decision: Flatcar + k3s'
+description: Why an immutable OS configured once by Ignition, and single-node k3s with its bundled Traefik.
+---
+
+**Status:** accepted (2026-07).
+
+## Context
+
+One node, no ops team. The OS should be boring and identical on every rebuild; deploying apps should be declarative
+and restart them forever; the whole node should come from code.
+
+## Decision
+
+- **Flatcar Container Linux**: an immutable, container-focused OS (read-only `/usr`, CNCF project) configured
+  **once** on first boot by **Ignition**, rendered from Butane by Terraform (`poseidon/ct`, strict validation).
+  OS auto-updates are **masked**: the node changes only when you rebuild it.
+- **k3s, single node**: Kubernetes in one binary (installed to `/opt/bin`), with the bundled **Traefik** (configured
+  through a `HelmChartConfig`), **ServiceLB** for host ports 80/443, the local-path provisioner for volumes, and an
+  AddOn controller that applies anything dropped into its manifests folder.
+
+## Consequences
+
+- + The node is reproducible: Terraform + Butane, nothing done by hand over SSH.
+- + Kubernetes gives restart-forever, rolling deploys, probes, RBAC and Secrets for free; kube-state-metrics makes
+  "is anything stuck" one set of rules.
+- + Single node means no network fabric to debug; everything on local disk.
+- − **Ignition runs once**: config changes after first boot must also be applied by hand on the live box.
+- − Single node = no failover. A reboot is downtime; the off-box watchdog makes sure you hear about it.
+- − Traps paid for: k3s' installer hard-fails on Flatcar's permissive SELinux without two flags; Flatcar's swap
+  units need the documented pattern (or boot-time ordering cycles); kubelet refuses swap unless told.
+- − With OS updates masked, security updates mean a planned rebuild: keep the rebuild path exercised.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| Ubuntu/Debian + Docker Compose (the previous server) | hand-maintained host, drift, no restart-forever semantics or probes; a real outage came from compose service names colliding |
+| Managed Kubernetes (Kapsule) | its node agent can't run Flatcar |
+| cert-manager | Traefik's own ACME (and later Origin CA certs) needs one controller less on the node |
+
+## How it was decided
+
+- The owner's requirement on night one: "everything should be reproducible on a new server". So Tailscale went into
+  Butane as a Flatcar system extension (the plan was an in-place `user_data` change), and every live fix since has
+  also gone into Butane.
+- The base was an existing small Flatcar + k3s repo. It was copied **without** its Terraform state, with renamed
+  resources, so nothing could touch the server that repo managed.
+- Defaults inherited from that base were questioned later (Let's Encrypt with a broad Cloudflare token): see
+  [Cloudflare](/decisions/cloudflare/).

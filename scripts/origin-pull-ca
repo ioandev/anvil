@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Create our own CA for Cloudflare Authenticated Origin Pulls, once per platform (idempotent: keeps existing files).
+#   .data/cloudflare-aop/ca.{key,crt}          the CA Traefik trusts (its public cert goes into Butane / the node)
+#   .data/cloudflare-aop/client.{key,crt}      the client cert Cloudflare presents (uploaded to every zone by
+#                                              scripts/cloudflare-zones.py)
+# Why our own: Cloudflare's shared origin-pull cert is presented by every Cloudflare customer, so trusting it would
+# let anyone's Cloudflare zone reach this server. EC P-256, 10 years. Encrypted twins: scripts/secrets.sh.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+set -a; [[ -f anvil.env ]] && . ./anvil.env; set +a
+D=.data/cloudflare-aop; NAME=${ANVIL_NAME:-anvil}
+mkdir -p "$D"; chmod 700 "$D"; umask 077
+if [[ -s $D/ca.crt && -s $D/client.crt ]]; then echo "exists: $D (ca + client)"; exit 0; fi
+openssl ecparam -name prime256v1 -genkey -noout -out "$D/ca.key"
+openssl req -x509 -new -key "$D/ca.key" -sha256 -days 3650 -subj "/O=$NAME/CN=$NAME origin-pull CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out "$D/ca.crt"
+openssl ecparam -name prime256v1 -genkey -noout -out "$D/client.key"
+openssl req -new -key "$D/client.key" -subj "/O=$NAME/CN=cloudflare-origin-pull" -out "$D/client.csr"
+printf 'basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "$D/client.ext"
+openssl x509 -req -in "$D/client.csr" -CA "$D/ca.crt" -CAkey "$D/ca.key" -CAcreateserial -sha256 -days 3650 \
+  -extfile "$D/client.ext" -out "$D/client.crt" 2>/dev/null
+rm -f "$D/client.csr" "$D/client.ext" "$D/ca.srl"
+openssl verify -CAfile "$D/ca.crt" "$D/client.crt"
+echo "created $D (encrypt: make secrets-encrypt)"

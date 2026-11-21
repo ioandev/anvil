@@ -1,0 +1,52 @@
+---
+title: 'Decision: SOPS in git'
+description: Why secrets are committed encrypted (SOPS + age) next to the code, and why a vault only holds operator credentials.
+---
+
+**Status:** accepted (2026-10-17); vault scope refined for anvil (2026-10-27).
+
+## Context
+
+Secrets were scattered across the old server's files and `.env`s. A rebuild must be possible from the repo alone,
+secrets must be versioned with the config that uses them, and an automation that runs unattended needs some
+credentials without holding the master key on disk.
+
+## Decision
+
+- Every secret file has a gitignored **plaintext working copy** and a committed **encrypted twin** (`.sops`,
+  SOPS + age, binary mode for byte-exact round trips). A pre-commit hook re-encrypts, refuses stale twins and
+  refuses tracked plaintext.
+- **One age key** decrypts everything; it lives on the operator's machine and in a password manager.
+- Kubernetes Secrets are **generated** from the plaintext at deploy time, never committed.
+- A **vault** (OpenBao on the second machine) holds only **operator/troubleshooting credentials** for unattended
+  automation (cluster access, Claude credential, status code, webhook token, off-site keys), never each app's
+  secrets.
+
+## Consequences
+
+- + `git clone` + the age key = everything needed to rebuild; secrets have history and review like code.
+- + No secrets service to run for the apps.
+- − The age key is a single root of trust: losing both copies loses every secret; leaking it exposes all of them.
+  Rotate secrets after any suspected leak, not just the key.
+- − Plaintext copies exist on the operator's machine (gitignored); protect that machine.
+- − Two stores (git and the vault) to keep in sync for the few operator credentials.
+
+## Alternatives considered
+
+| Option | Why not |
+|---|---|
+| A vault for everything | another critical service the apps depend on; its own backup and unseal story |
+| sops dotenv mode | lossy round trips (comments, ordering) |
+| Infisical / Vaultwarden | custom roles paid when self-hosted / ruled out by the owner |
+
+## How it was decided
+
+- The owner: "I want the secrets in git because I have no other way of storing them, unless you suggest something
+  else we can deploy, which I'd need backups of anyway." Claude proposed SOPS + age so they could be in git encrypted.
+- sops' dotenv mode silently rewrote 4 of 17 files in the first round trip; caught by a fresh-machine decrypt test,
+  hence **binary mode**.
+- Claude's permissions didn't allow printing the age private key; the owner displayed it himself to store it.
+- Later, for unattended automation, Claude compared self-hosted vaults: OpenBao (free, policies, machine logins,
+  audit log) won over Passbolt CE (tag-based sharing is paid), Infisical (custom roles paid when self-hosted) and
+  Vaultwarden (ruled out by the owner). The owner first put everything in it; for anvil he decided it holds **only
+  operator credentials, never the apps' secrets**.
