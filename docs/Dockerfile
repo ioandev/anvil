@@ -3,7 +3,7 @@
 #
 #   podman build -t anvil-docs .                                         # base /anvil, site https://ioan.dev
 #   podman build --build-arg ASTRO_BASE=/ --build-arg ANVIL_DOCS_SITE=https://docs.example.com -t anvil-docs .
-#   podman run --rm -p 8080:8080 --read-only --tmpfs /tmp anvil-docs     # then http://localhost:8080/anvil/
+#   podman run --rm -p 8080:8080 --read-only --tmpfs /tmp anvil-docs     # then http://localhost:8080/anvil
 #
 # The base path is baked in at build time (every link contains it), so one image serves one base path.
 

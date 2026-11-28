@@ -21,10 +21,12 @@ const base = ('/' + rawBase.replace(/^\/+|\/+$/g, '')).replace(/^\/$/, '') // "/
 // the sidebar, but not for links inside pages, so this remark plugin does it (links, link definitions and the
 // href of MDX components such as <LinkCard>). The post-build check (scripts/check-links.mjs) proves none are broken.
 function remarkBaseLinks() {
-  const fix = (u) =>
-    typeof u === 'string' && base && u.startsWith('/') && !u.startsWith('//') && u !== base && !u.startsWith(base + '/')
-      ? base + u
-      : u
+  // No trailing slashes (trailingSlash: 'never' below): "/components/edge/#x" becomes "<base>/components/edge#x".
+  const noSlash = (u) => u.replace(/(.)\/+(?=$|[?#])/, '$1')
+  const fix = (u) => {
+    if (typeof u !== 'string' || !u.startsWith('/') || u.startsWith('//')) return u
+    return noSlash(base && u !== base && !u.startsWith(base + '/') ? base + u : u)
+  }
   const walk = (node) => {
     if (node.type === 'link' || node.type === 'definition') node.url = fix(node.url)
     if ((node.type === 'mdxJsxFlowElement' || node.type === 'mdxJsxTextElement') && Array.isArray(node.attributes)) {
@@ -38,6 +40,9 @@ function remarkBaseLinks() {
 export default defineConfig({
   site,
   base: base || '/',
+  // Page URLs never end in a slash (/anvil/architecture, not /anvil/architecture/): links, canonical URLs, the sitemap
+  // and search results follow this, and nginx (nginx.conf) redirects a slashed URL to its slash-less form.
+  trailingSlash: 'never',
   markdown: { processor: unified({ remarkPlugins: [remarkBaseLinks] }) },
   integrations: [
     starlight({
@@ -51,6 +56,9 @@ export default defineConfig({
         : { src: brand?.logo ? `${BRAND}/${brand.logo}` : './src/assets/logo.svg', replacesTitle: !!brand?.replacesTitle },
       customCss: ['./src/styles/custom.css', ...(fs.existsSync(`${BRAND}/brand.css`) ? [`${BRAND}/brand.css`] : [])],
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/ioandev/anvil' }],
+      // Hero buttons' relative links (index.mdx: overview, quickstart) become <base>/overview: pages have no trailing
+      // slash, so a relative link on the home page would otherwise resolve outside the base.
+      routeMiddleware: './src/routeData.ts',
       components: {
         Head: './src/components/Head.astro',   // + each page's Open Graph image (src/og.mjs)
         ...(brand?.links?.length ? { SocialIcons: './src/components/BrandLinks.astro' } : {}),

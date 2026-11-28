@@ -40,20 +40,31 @@ const problems = []
 let checked = 0
 for (const file of htmlFiles) {
   const html = readFileSync(file, 'utf8')
+  // The page's own address, without a trailing slash (trailingSlash: 'never'): relative links resolve against it, so
+  // "overview" on <base>/index.html points at /overview, not <base>/overview.
+  const rel = relative(dist, file).replace(/(^|\/)index\.html$/, '').replace(/\.html$/, '')
+  const pagePath = `${base}${rel ? '/' + rel : ''}` || '/'
   for (const m of html.matchAll(/\s(?:href|src)="([^"]*)"/g)) {
-    const url = m[1].replace(/&amp;/g, '&')
+    let url = m[1].replace(/&amp;/g, '&')
     if (!url || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(url)) continue // external, mailto:, data:, …
     const where = relative(dist, file)
+    if (!url.startsWith('/') && !url.startsWith('#')) {
+      const u = new URL(url, 'https://docs.invalid' + pagePath)
+      url = u.pathname + u.search + u.hash
+    }
     if (url.startsWith('#')) {
       const id = decodeURIComponent(url.slice(1))
       if (id && !idsOf(file).has(id)) problems.push(`${where}: missing anchor ${url}`)
       checked++
       continue
     }
-    if (!url.startsWith('/')) continue // relative links: resolved by the browser, rare here (hero actions); skip
     checked++
     const [pathAndQuery, frag] = url.split('#')
     const path = pathAndQuery.split('?')[0]
+    if (path !== '/' && path.endsWith('/')) {
+      problems.push(`${where}: trailing slash (pages are served without one): ${url}`)
+      continue
+    }
     if (base && path !== base && !path.startsWith(base + '/')) {
       problems.push(`${where}: link outside the base path ${base}: ${url}`)
       continue

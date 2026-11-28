@@ -12,6 +12,13 @@ each endpoint is a shell script in `platform/webhook/hooks/`, mounted from the C
 `configmaps:`, built by `node.sh deploy webhook`). It answers at `https://status.<your-domain>`. Every endpoint is a plain 200/500, so any uptime
 checker, cron job or phone widget can poll it.
 
+<Aside type="note" title="The patched source, as a fork">
+The same two log changes are also published as a ready-to-build fork,
+[ioandev/webhookd](https://github.com/ioandev/webhookd): the copy anvil's original server runs, on an older upstream (v1.20.1), with an
+image that runs as a fixed UID/GID and adds `grepcidr`. anvil doesn't depend on it: `images/webhookd` builds from
+upstream's pinned release plus `logger.patch`, so an install needs nothing but upstream.
+</Aside>
+
 ## Access: say nothing to strangers
 
 | Request | Needs | Otherwise |

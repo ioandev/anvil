@@ -47,7 +47,7 @@ in `astro.config.mjs`. `src/components/` holds the diagram components (`Diagram.
 ```sh
 podman build -t anvil-docs .
 podman run --rm -p 8080:8080 --read-only --tmpfs /tmp anvil-docs
-curl -I http://localhost:8080/anvil/            # 200
+curl -I http://localhost:8080/anvil            # 200
 curl -s http://localhost:8080/healthz           # ok
 
 podman build --build-arg ASTRO_BASE=/ --build-arg ANVIL_DOCS_SITE=https://docs.example.com -t anvil-docs:root .
