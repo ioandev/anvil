@@ -1,0 +1,9 @@
+# webhookd for anvil: built from this repository's own Dockerfile (its distrib stage) at this commit, nothing added.
+# github.com/ioandev/webhookd is a GitHub fork of ncarlier/webhookd: upstream's master (including the hook-path
+# traversal fix, GHSA-9g3f-ppc3-jx8p) plus two commits: the request log never holds a secret (code, token and
+# password logged as ok / wrong / set; client IP from CF-Connecting-IP), and current base images (Alpine 3.24).
+# scripts/build-images clones it, checks out the commit (with its submodule) and builds the target.
+# To update: move the commit to the fork's newer master (after rebasing its commits onto upstream), then make images.
+url=https://github.com/ioandev/webhookd.git
+commit=f43eda04fff21b8527c5ff3aca57946d4eac1172
+target=distrib

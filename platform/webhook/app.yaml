@@ -59,7 +59,7 @@ spec:
       imagePullSecrets: [{ name: anvil-registry }]   # our own webhookd image (the node's registry login can't read it)
       containers:
         - name: webhookd
-          image: "${ANVIL_REGISTRY}/webhookd:${ANVIL_WEBHOOKD_TAG}"   # images/webhookd: upstream + redacted request log
+          image: "${ANVIL_REGISTRY}/webhookd:${ANVIL_WEBHOOKD_TAG}"   # images/webhookd/source: github.com/ioandev/webhookd at a pinned commit (upstream + redacted request log, current Alpine)
           securityContext: { allowPrivilegeEscalation: false }
           env:
             - { name: WHD_HOOK_SCRIPTS, value: /scripts }

@@ -16,12 +16,21 @@ for spec in "$@"; do
   tag=$(scripts/image-tag "$dir")
   [[ $tag == *-dirty-* ]] && { echo "$name: $dir has uncommitted changes; commit first (dirty builds are for testing only)"; exit 1; }
   ref="$ANVIL_REGISTRY/$name:$tag"
+  # A folder with a "source" file is an image built from another repository's own Dockerfile, pinned to a commit
+  # (images/webhookd): clone it, check out that commit with its submodules, build the named target.
+  ctx=$dir targ=()
+  if [[ -f $dir/source ]]; then
+    url=$(sed -n 's/^url=//p' "$dir/source") commit=$(sed -n 's/^commit=//p' "$dir/source") target=$(sed -n 's/^target=//p' "$dir/source")
+    ctx=$(mktemp -d)
+    git clone -q "$url" "$ctx" && git -C "$ctx" checkout -q "$commit" && git -C "$ctx" submodule update -q --init
+    [[ -n $target ]] && targ=(--target "$target")
+  fi
   if [[ $name == twilio-alert ]]; then arches="amd64 arm64"; else arches="amd64"; fi
   podman manifest rm "$ref" >/dev/null 2>&1 || true
   podman manifest create "$ref" >/dev/null
   for a in $arches; do
     echo "== $name ($a) from $dir"
-    podman build --platform "linux/$a" -t "$ref-$a" "$dir"
+    podman build --platform "linux/$a" "${targ[@]}" -t "$ref-$a" "$ctx"
     podman manifest add "$ref" "containers-storage:$ref-$a" >/dev/null
   done
   podman manifest push --all "$ref" "docker://$ref"
@@ -32,4 +41,5 @@ for spec in "$@"; do
   python3 -I scripts/anvil-secrets set "$var=$tag" >/dev/null
   echo "pushed $ref ($var=$tag)"
   for a in $arches; do podman rmi "$ref-$a" >/dev/null 2>&1 || true; done   # disk: keep only the registry copy
+  [[ $ctx != "$dir" ]] && rm -rf "$ctx"
 done
