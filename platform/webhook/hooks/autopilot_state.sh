@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # POST /autopilot_state (header X-Token): the autopilot on the Mac reports its state every 15 s (body: see
-# docs/autopilot-interfaces.md). Stored in /locks/autopilot/state.json with the time received. Answers with the owner's
+# INTERFACES.md in github.com/ioandev/autopilot). Stored in /locks/autopilot/state.json with the time received. Answers with the owner's
 # queued commands (reset / pause / resume, from the GET links), once. Tells twilio-alert when a run starts (hold the
 # calls up to 20 min, once per incident) and when it ends (calls resume, with its summary in the call).
 

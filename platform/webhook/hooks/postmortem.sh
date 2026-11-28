@@ -2,7 +2,7 @@
 
 # POST /postmortem (header X-Token) with {"author": "autopilot|owner|claude", "text": "<markdown>", "at": "<ISO, optional>"}:
 # appends "## HH:MM (UK) · <author>" + text to /locks/postmortems/<date>.md, where <date> is the UK date of "at"
-# (default now) minus one day if it's before 08:00 UK time. Read them with GET /changelog. (docs/autopilot-interfaces.md)
+# (default now) minus one day if it's before 08:00 UK time. Read them with GET /changelog. (INTERFACES.md in github.com/ioandev/autopilot)
 
 DIR=/locks/postmortems
 METHOD=$(echo "$hook_method" | tr '[:lower:]' '[:upper:]')

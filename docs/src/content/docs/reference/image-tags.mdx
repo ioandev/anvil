@@ -38,7 +38,8 @@ It stops on the first failure: a manifest must never point at an image that wasn
 original platform, and only the rolling update's "keep the old pod until the new one is ready" kept the site up).
 
 The node pulls with credentials written to `/etc/rancher/k3s/registries.yaml` on first boot (`registry_password` = the
-Scaleway secret key). The autopilot image is built from its own repo (`./build.sh`, the same multi-arch scheme).
+Scaleway secret key). The autopilot image is built from [its own repo](https://github.com/ioandev/autopilot)
+(`REGISTRY=$ANVIL_REGISTRY/autopilot ./build.sh`, the same tags and multi-arch scheme).
 
 ## Images for the home machine
 

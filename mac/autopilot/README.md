@@ -1,6 +1,6 @@
 # autopilot on the Mac mini
 
-Runs the autopilot (source and full docs: `/repos/autopilot/`, its README and `INTERFACES.md`) on
+Runs the autopilot (source and full docs: https://github.com/ioandev/autopilot, its README and `INTERFACES.md`) on
 `${ANVIL_HOME_SSH}`. It watches the server's alerts over the tailnet and, when one stays on, runs Claude Code
 headless to diagnose and fix it with live-only actions (rollout restart/undo, re-run a CronJob, delete one stuck
 pod, prune images, restart `` / `${ANVIL_NAME}-watchdog` / `openbao` here), then reports.
@@ -22,8 +22,9 @@ with `~/${ANVIL_NAME}-openbao/claude.approle`.
 ## Ship a new image (from the Linux machine)
 
 ```sh
-cd the autopilot repo && ./build.sh <n>          # pushes ${ANVIL_REGISTRY}/autopilot:<sha>-<n>
-R=${ANVIL_REGISTRY}/autopilot; T=<sha>-<n>
+git clone https://github.com/ioandev/autopilot && cd autopilot
+REGISTRY=${ANVIL_REGISTRY}/autopilot ./build.sh <n>   # pushes ${ANVIL_REGISTRY}/autopilot:<YYYYMMDD>-<sha>[-<n>]
+R=${ANVIL_REGISTRY}/autopilot; T=<the tag it printed>
 podman save $R:$T-arm64 | ssh ${ANVIL_HOME_SSH} \
   'PATH=$PATH:/Applications/Docker.app/Contents/Resources/bin; docker load && docker tag '$R:$T-arm64' '$R:$T
 ```

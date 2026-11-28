@@ -1,4 +1,4 @@
-# Site config for the autopilot (its own repo, README there): the container on the home machine that runs Claude Code
+# Site config for the autopilot (github.com/ioandev/autopilot: README and INTERFACES.md there): the container on the home machine that runs Claude Code
 # when the platform's alerts stay on. ${ANVIL_*} come from anvil.env (rendered by the 70-autopilot step). Read from
 # this repo at run time (a copy on the home machine is the fallback). No secrets here: secret entries are vault refs.
 name: ${ANVIL_NAME}

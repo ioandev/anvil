@@ -14,8 +14,8 @@ description: Eighth anvil bootstrap step. Installs the autopilot (Claude Code in
    secrets, never the server's SSH key, never the age private key**: the autopilot has no root and can't decrypt
    anything (platform/autopilot-access: what its login may do is enforced by the cluster). Snapshot bucket →
    `ANVIL_OPENBAO_BUCKET`.
-2. **The image**: build from the autopilot repo (`../autopilot`, `./build.sh`), push multi-arch, set
-   `ANVIL_AUTOPILOT_TAG`. A **read-only** deploy key for this repo on GitHub (the autopilot clones it; it can never
+2. **The image**: clone https://github.com/ioandev/autopilot and build it there (`REGISTRY=$ANVIL_REGISTRY/autopilot ./build.sh`: amd64 + arm64
+   under one tag, pushed), set `ANVIL_AUTOPILOT_TAG` to the tag it prints. A **read-only** deploy key for this repo on GitHub (the autopilot clones it; it can never
    push).
 3. The Claude credential goes into the vault, never into a file on the home machine: `ops/autopilot`
    `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) or `ANTHROPIC_API_KEY` (with a spend limit). Then

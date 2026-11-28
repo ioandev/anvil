@@ -8,8 +8,8 @@ import AutopilotLoop from '../../../components/AutopilotLoop.astro'
 
 The autopilot is an unattended on-call engineer: a container that polls Prometheus and Alertmanager every 15 s and,
 when an alert stays on, runs [Claude Code](https://docs.anthropic.com/en/docs/claude-code) headless to diagnose and
-(within strict limits) fix it, verifies the result and reports. It lives in its own MIT-licensed repo (`autopilot`)
-and is generic: the site describes itself in an `autopilot.yaml` in its own repo, and secrets come from the vault
+(within strict limits) fix it, verifies the result and reports. It lives in its own MIT-licensed repo,
+[ioandev/autopilot](https://github.com/ioandev/autopilot), and is generic: the site describes itself in an `autopilot.yaml` in its own repo, and secrets come from the vault
 at run time.
 
 <AutopilotLoop />

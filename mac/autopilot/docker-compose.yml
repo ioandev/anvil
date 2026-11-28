@@ -1,4 +1,4 @@
-# The autopilot on the Mac mini (source: /repos/autopilot (README there); the server's side: docs/autopilot-interfaces.md). It polls the server's
+# The autopilot on the Mac mini (source: github.com/ioandev/autopilot, README there; the contract with the server: its INTERFACES.md). It polls the server's
 # Alertmanager/Prometheus over the tailnet every 15 s; when an alert stays on it runs Claude Code headless to fix
 # it (live-only actions, enforced by its PreToolUse guard), then reports (post-mortem, email, records here and off-site; git is read-only).
 # Heartbeat: POST https://status.${ANVIL_DOMAIN}/autopilot_state; owner commands: https://status.${ANVIL_DOMAIN}/autopilot?code=…

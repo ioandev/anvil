@@ -119,7 +119,7 @@ connect), SSH answers on `ANVIL_SSH_PORT`, port 22 is closed, the node is Ready.
    key, your login, the AppRole `claude` with the read-only `claude-ops` policy. Under `secret/ops/` only
    operator/troubleshooting credentials (SSH key, status code, webhook token, the backup key for email, the age key
    for read-only decrypts, the off-site snapshot key). **Never the apps' secrets.**
-2. **The image** from the autopilot repo (`./build.sh`, multi-arch) → `ANVIL_AUTOPILOT_TAG`; a **read-only** deploy key
+2. **The image** from [the autopilot repo](https://github.com/ioandev/autopilot) (`REGISTRY=$ANVIL_REGISTRY/autopilot ./build.sh`, multi-arch) → `ANVIL_AUTOPILOT_TAG`; a **read-only** deploy key
    on GitHub (it clones, it can never push).
 3. `~/<name>-autopilot/secrets.env` on the home machine (Claude credential, AppRole id/secret), then
    `scripts/home-deploy autopilot <image>` (renders `autopilot.yaml` too).
